@@ -1,0 +1,7 @@
+version: "0.0.1"
+description: "Learning scaffold for a standalone DShot transport; driver implementation pending"
+targets:
+  - esp32s3
+  - esp32c3
+dependencies:
+  idf: ">=6.1,<6.2"

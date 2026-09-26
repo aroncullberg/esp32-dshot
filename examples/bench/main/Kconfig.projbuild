@@ -1,0 +1,12 @@
+menu "DShot bench"
+    config DSHOT_BENCH_GPIO
+        int "Signal GPIO"
+        range -1 21 if IDF_TARGET_ESP32C3
+        range -1 48 if IDF_TARGET_ESP32S3
+        default -1
+
+    config DSHOT_BENCH_ARM_HOLD_MS
+        int "Zero-frame arming time (milliseconds)"
+        range 0 30000
+        default 5000
+endmenu

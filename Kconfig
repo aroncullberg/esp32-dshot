@@ -1,0 +1,77 @@
+menu "DShot"
+    depends on IDF_TARGET_ESP32S3 || IDF_TARGET_ESP32C3
+
+    choice DSHOT_DEFAULT_PROTOCOL
+        prompt "Default DShot bitrate"
+        default DSHOT_DEFAULT_D600
+        config DSHOT_DEFAULT_D150
+            bool "DShot150"
+        config DSHOT_DEFAULT_D300
+            bool "DShot300"
+        config DSHOT_DEFAULT_D600
+            bool "DShot600"
+    endchoice
+
+    config DSHOT_DEFAULT_BITRATE
+        int
+        default 150000 if DSHOT_DEFAULT_D150
+        default 300000 if DSHOT_DEFAULT_D300
+        default 600000
+
+    choice DSHOT_DEFAULT_SIGNALING
+        prompt "Default signaling"
+        default DSHOT_DEFAULT_REGULAR
+        help
+            The first tutorial implements regular DShot. Bidirectional signaling
+            requires output release and a bounded reply window before use.
+        config DSHOT_DEFAULT_REGULAR
+            bool "Regular"
+        config DSHOT_DEFAULT_BIDIRECTIONAL
+            bool "Bidirectional (requires later implementation)"
+    endchoice
+
+    config DSHOT_DEFAULT_FRAME_HZ
+        int "Default frames per second"
+        range 100 8000
+        default 1000
+        help
+            A constructor default, not a promise that every bitrate/signaling
+            combination fits. The driver must validate the complete exchange.
+            Start the proof of concept at 1000 Hz; 4000 Hz is the later target.
+
+    config DSHOT_DEFAULT_TASK_PRIORITY
+        int "Default worker task priority"
+        range 1 20
+        default 10
+
+    config DSHOT_DEFAULT_TASK_STACK_BYTES
+        int "Default worker task stack size (bytes)"
+        range 2048 16384
+        default 4096
+        help
+            ESP-IDF task stack sizes are expressed in bytes.
+
+    config DSHOT_DEFAULT_TASK_CORE
+        int "Default worker task core (-1 for no affinity)"
+        range -1 0 if FREERTOS_UNICORE
+        range -1 1 if !FREERTOS_UNICORE
+        default -1
+        help
+            Task placement only. Interrupt placement follows where channels are
+            allocated; this setting does not move an already allocated interrupt.
+
+    config DSHOT_DEFAULT_ERPM_MAX_AGE_US
+        int "Default eRPM maximum age (microseconds; future telemetry)"
+        range 1000 1000000
+        default 10000
+        help
+            Reserved as the default for the later telemetry implementation.
+            This setting does not enable reception or EDT in the proof of concept.
+
+    config DSHOT_TIMING_DIAGNOSTICS
+        bool "Compile detailed timing instrumentation (future implementation)"
+        default n
+        help
+            Reserved build option for extra internal timing measurements.
+            Basic error/frame counters should remain available without it.
+endmenu
