@@ -1,12 +1,14 @@
 #include "dshot/driver.hpp"
 #include "dshot/link.hpp"
 #include "config_validation.hpp"
+#include "frame_scheduler.hpp"
 
 #include <array>
 #include <atomic>
 #include <cstdlib>
 #include <new>
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -15,6 +17,17 @@
 namespace dshot {
 namespace {
 constexpr const char* kTag = "dshot";
+#if CONFIG_DSHOT_TIMING_DIAGNOSTICS
+constexpr bool kDetailedTiming = true;
+void record(TimingStatistics& timing, std::uint64_t elapsed_us) {
+    if (timing.count == 0 || elapsed_us < timing.min_us) timing.min_us = elapsed_us;
+    if (elapsed_us > timing.max_us) timing.max_us = elapsed_us;
+    ++timing.count;
+    timing.total_us += elapsed_us;
+}
+#else
+constexpr bool kDetailedTiming = false;
+#endif
 #if CONFIG_IDF_TARGET_ESP32C3
 constexpr std::size_t kMaxLinks = 2;
 #elif CONFIG_IDF_TARGET_ESP32S3
@@ -27,11 +40,17 @@ constexpr std::size_t kMaxLinks = 4;
 struct Driver::Impl {
     std::array<Link*, kMaxLinks> links{};
     std::size_t link_count = 0;
-    TaskHandle_t worker_task = nullptr;
+    detail::FrameScheduler scheduler;
     SemaphoreHandle_t worker_exited = nullptr;
     bool join_pending = false; // Accessed only by serialized lifecycle calls.
     std::atomic<bool> stop_requested{false};
     std::atomic<esp_err_t> last_error{ESP_OK};
+    portMUX_TYPE statistics_lock = portMUX_INITIALIZER_UNLOCKED;
+    DriverStatistics statistics;
+    std::int64_t started_at_us = 0;
+#if CONFIG_DSHOT_TIMING_DIAGNOSTICS
+    std::array<std::int64_t, kMaxLinks> last_completed_us{};
+#endif
 };
 
 Driver::Driver(const Config& config) : config_(config) {}
@@ -99,39 +118,102 @@ esp_err_t Driver::start() {
         impl_->worker_exited = xSemaphoreCreateBinary();
         if (!impl_->worker_exited) return ESP_ERR_NO_MEM;
     }
+    const auto timer_error = impl_->scheduler.open(config_.frame_hz);
+    if (timer_error != ESP_OK) return timer_error;
     (void)xSemaphoreTake(impl_->worker_exited, 0);
     impl_->stop_requested.store(false);
     impl_->last_error.store(ESP_OK);
+    portENTER_CRITICAL(&impl_->statistics_lock);
+    impl_->statistics = {};
+    impl_->statistics.running = true;
+    impl_->statistics.detailed_timing = kDetailedTiming;
+    impl_->statistics.timer_period_us = impl_->scheduler.period_us();
+    impl_->statistics.link_count = impl_->link_count;
+    for (std::size_t i = 0; i < impl_->link_count; ++i) {
+        impl_->statistics.links[i].gpio = impl_->links[i]->pin_;
+    }
+    impl_->started_at_us = esp_timer_get_time();
+#if CONFIG_DSHOT_TIMING_DIAGNOSTICS
+    impl_->last_completed_us.fill(0);
+#endif
+    portEXIT_CRITICAL(&impl_->statistics_lock);
     impl_->join_pending = true;
     const BaseType_t result = xTaskCreatePinnedToCore(
         worker_entry, "dshot_tx", config_.task_stack_bytes, this, config_.task_priority,
-        &impl_->worker_task, config_.task_core == -1 ? tskNO_AFFINITY : config_.task_core);
+        nullptr, config_.task_core == -1 ? tskNO_AFFINITY : config_.task_core);
     if (result != pdPASS) {
-        impl_->worker_task = nullptr;
+        impl_->scheduler.close();
         impl_->join_pending = false;
         impl_->last_error.store(ESP_ERR_NO_MEM);
+        portENTER_CRITICAL(&impl_->statistics_lock);
+        impl_->statistics.running = false;
+        portEXIT_CRITICAL(&impl_->statistics_lock);
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
 }
 
 void Driver::stop() {
-    if (!impl_ || !impl_->join_pending) return;
+    if (!impl_) return;
+    if (!impl_->join_pending) {
+        for (std::size_t i = 0; i < impl_->link_count; ++i) impl_->links[i]->cancel_pending_command();
+        return;
+    }
     impl_->stop_requested.store(true);
+    impl_->scheduler.wake();
     // The worker finishes/aborts its active TX and acknowledges its last owner access.
     if (xSemaphoreTake(impl_->worker_exited, portMAX_DELAY) != pdTRUE) std::abort();
     impl_->join_pending = false;
-    impl_->worker_task = nullptr;
 }
 
 esp_err_t Driver::last_error() const {
     return impl_ ? impl_->last_error.load() : ESP_OK;
 }
 
-esp_err_t Driver::send_once() {
+DriverStatistics Driver::statistics() const {
+    DriverStatistics result;
+    result.detailed_timing = kDetailedTiming;
+    if (!impl_) return result;
+    portENTER_CRITICAL(&impl_->statistics_lock);
+    result = impl_->statistics;
+    result.detailed_timing = kDetailedTiming;
+    if (result.running) result.elapsed_us = esp_timer_get_time() - impl_->started_at_us;
+    portEXIT_CRITICAL(&impl_->statistics_lock);
+    return result;
+}
+
+esp_err_t Driver::send_once(std::uint64_t& wait_us) {
+    wait_us = 0;
     for (std::size_t i = 0; i < impl_->link_count; ++i) {
         if (impl_->stop_requested.load()) break;
-        const auto error = impl_->links[i]->transmit_pending();
+        std::uint64_t link_wait_us = 0;
+#if CONFIG_DSHOT_TIMING_DIAGNOSTICS
+        const auto started = esp_timer_get_time();
+#endif
+        bool transmitted = false;
+        const auto error = impl_->links[i]->transmit_pending(&link_wait_us, transmitted);
+#if CONFIG_DSHOT_TIMING_DIAGNOSTICS
+        const auto completed = esp_timer_get_time();
+#endif
+        wait_us += link_wait_us;
+        portENTER_CRITICAL(&impl_->statistics_lock);
+        auto& link = impl_->statistics.links[i];
+        if (transmitted) ++link.completed_frames;
+        else if (error != ESP_OK) ++link.tx_errors;
+        else ++link.command_pauses;
+#if CONFIG_DSHOT_TIMING_DIAGNOSTICS
+        if (transmitted || error != ESP_OK) {
+            record(link.outside_tx_wait, completed - started - link_wait_us);
+            record(link.tx_wait, link_wait_us);
+        }
+        if (transmitted) {
+            if (link.completed_frames > 1) {
+                record(link.completion_interval, completed - impl_->last_completed_us[i]);
+            }
+            impl_->last_completed_us[i] = completed;
+        }
+#endif
+        portEXIT_CRITICAL(&impl_->statistics_lock);
         if (error != ESP_OK) return error;
     }
     return ESP_OK;
@@ -143,22 +225,58 @@ void Driver::worker_entry(void* argument) {
 }
 
 void Driver::worker_loop() {
-    const TickType_t period_ticks = configTICK_RATE_HZ / config_.frame_hz;
-    TickType_t last_wake_tick = xTaskGetTickCount();
-    while (!impl_->stop_requested.load()) {
-        const auto error = send_once();
+    if (!impl_->stop_requested.load()) {
+        const auto error = impl_->scheduler.start();
+        if (error != ESP_OK) {
+            impl_->last_error.store(error);
+            ESP_LOGE(kTag, "Timer start failed: %s", esp_err_to_name(error));
+        }
+    }
+    while (!impl_->stop_requested.load() && impl_->last_error.load() == ESP_OK) {
+        // Consume all notifications together: one current frame, no backlog.
+        const auto alarms = ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        if (impl_->stop_requested.load()) break;
+        if (alarms == 0) continue;
+        portENTER_CRITICAL(&impl_->statistics_lock);
+        impl_->statistics.missed_slots += alarms - 1;
+        portEXIT_CRITICAL(&impl_->statistics_lock);
+        std::uint64_t wait_us = 0;
+#if CONFIG_DSHOT_TIMING_DIAGNOSTICS
+        const auto started = esp_timer_get_time();
+#endif
+        const auto error = send_once(wait_us);
+#if CONFIG_DSHOT_TIMING_DIAGNOSTICS
+        const auto elapsed = esp_timer_get_time() - started;
+#endif
+        portENTER_CRITICAL(&impl_->statistics_lock);
+        ++impl_->statistics.worker_iterations;
+#if CONFIG_DSHOT_TIMING_DIAGNOSTICS
+        record(impl_->statistics.worker_pass, elapsed);
+        record(impl_->statistics.outside_tx_wait, elapsed - wait_us);
+#endif
+        portEXIT_CRITICAL(&impl_->statistics_lock);
         if (error != ESP_OK) {
             impl_->last_error.store(error);
             ESP_LOGE(kTag, "TX failed: %s", esp_err_to_name(error));
             break;
         }
         if (impl_->stop_requested.load()) break;
-        if (xTaskDelayUntil(&last_wake_tick, period_ticks) == pdFALSE) {
-            // Skip missed slots instead of sending a burst of catch-up frames.
-            last_wake_tick = xTaskGetTickCount();
-            (void)xTaskDelayUntil(&last_wake_tick, period_ticks);
-        }
+        // Alarms delivered during this transmission pass are already stale.
+        // Retire them, then block for the next alarm instead of transmitting again.
+        const auto skipped = ulTaskNotifyTake(pdTRUE, 0);
+        if (impl_->stop_requested.load()) break; // A stop wake-up is not a missed slot.
+        portENTER_CRITICAL(&impl_->statistics_lock);
+        impl_->statistics.missed_slots += skipped;
+        portEXIT_CRITICAL(&impl_->statistics_lock);
     }
+    impl_->scheduler.close();
+    for (std::size_t i = 0; i < impl_->link_count; ++i) {
+        impl_->links[i]->cancel_pending_command();
+    }
+    portENTER_CRITICAL(&impl_->statistics_lock);
+    impl_->statistics.elapsed_us = esp_timer_get_time() - impl_->started_at_us;
+    impl_->statistics.running = false;
+    portEXIT_CRITICAL(&impl_->statistics_lock);
     const auto exited = impl_->worker_exited;
     if (xSemaphoreGive(exited) != pdTRUE) std::abort();
 }

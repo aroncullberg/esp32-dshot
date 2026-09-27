@@ -22,7 +22,6 @@ namespace dshot {
     constexpr unsigned kMinTaskStackBytes = 2048;
     constexpr unsigned kMaxTaskStackBytes = 16384;
 
-    constexpr unsigned kTickRateHz = static_cast<unsigned>(configTICK_RATE_HZ);
     constexpr unsigned kMaxTaskPriority = static_cast<unsigned>(configMAX_PRIORITIES - 1);
 
     bool is_valid_task_core(int core) {
@@ -30,8 +29,8 @@ namespace dshot {
     }
 
     bool is_valid_framerate(unsigned frame_hz) {
-        // frame_hz must be non-zero, less than or equal to the tick rate, and evenly divide the tick rate
-        return frame_hz != 0 && frame_hz <= kTickRateHz && kTickRateHz % frame_hz == 0;
+        // GPTimer cadence is independent of the FreeRTOS tick rate.
+        return frame_hz != 0 && frame_hz <= 8000;
     }
 
 

@@ -17,6 +17,8 @@
 #include "idf_transport.hpp"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "esp_timer.h"
+#include "frame_scheduler.hpp"
 
 using namespace std::chrono_literals;
 using namespace dshot;
@@ -26,6 +28,24 @@ struct HostSemaphore {
     std::mutex mutex;
     std::condition_variable changed;
     bool token = false;
+};
+struct HostTask {
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::uint32_t notifications = 0;
+    bool deleted = false;
+    std::atomic<bool> waiting{false};
+    std::thread thread;
+};
+struct HostTimer {
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::atomic<bool> running{false};
+    bool enabled = false;
+    unsigned period_us = 0;
+    gptimer_alarm_cb_t callback = nullptr;
+    void* context = nullptr;
+    std::thread thread;
 };
 struct rmt_channel_t {
     bool enabled = false;
@@ -42,16 +62,24 @@ std::mutex wire_mutex;
 std::condition_variable wire_changed;
 bool hold_wait = false, entered_wait = false;
 std::vector<std::uint16_t> wire_packets;
-std::vector<std::unique_ptr<std::thread>> tasks;
+std::vector<std::unique_ptr<HostTask>> tasks;
+thread_local HostTask* current_task = nullptr;
+std::atomic<int> timers{0};
+std::atomic<bool> fail_timer_new{false}, fail_timer_register{false}, fail_timer_alarm{false};
+std::atomic<bool> fail_timer_enable{false}, fail_timer_start{false};
+std::atomic<bool> fail_timer_enable_partial{false};
+bool manual_timer = false;
+std::atomic<HostTimer*> active_timer{nullptr};
 const auto clock_start = std::chrono::steady_clock::now();
+std::atomic<std::int64_t> command_clock_us{-1};
 
 void join_tasks() {
-    for (auto& task : tasks) task->join();
+    for (auto& task : tasks) task->thread.join();
     tasks.clear();
 }
 void clean() {
     join_tasks();
-    assert(channels == 0 && encoders == 0);
+    assert(channels == 0 && encoders == 0 && timers == 0);
 }
 Config config() {
     Config result;
@@ -88,22 +116,130 @@ BaseType_t xTaskCreatePinnedToCore(void (*entry)(void*), const char*, unsigned, 
                                   unsigned, TaskHandle_t* handle, int core) {
     assert(core == -1 || (core >= 0 && core < configNUMBER_OF_CORES));
     if (fail_task.exchange(false)) return pdFALSE;
-    auto task = std::make_unique<std::thread>(entry, arg);
-    *handle = task.get();
+    auto task = std::make_unique<HostTask>();
+    if (handle) *handle = task.get();
+    task->thread = std::thread([entry,arg,self=task.get()] {
+        current_task = self;
+        entry(arg);
+    });
     tasks.push_back(std::move(task));
     return pdPASS;
 }
-void vTaskDelete(TaskHandle_t) {}
+void vTaskDelete(TaskHandle_t) {
+    std::lock_guard lock(current_task->mutex);
+    current_task->deleted = true;
+}
+TaskHandle_t xTaskGetCurrentTaskHandle() { return current_task; }
+BaseType_t xTaskNotifyGive(TaskHandle_t handle) {
+    auto& task = *static_cast<HostTask*>(handle);
+    std::lock_guard lock(task.mutex);
+    assert(!task.deleted);
+    ++task.notifications;
+    task.changed.notify_one();
+    return pdPASS;
+}
+void vTaskNotifyGiveFromISR(TaskHandle_t handle, BaseType_t* woken) {
+    xTaskNotifyGive(handle);
+    *woken = pdTRUE;
+}
+std::uint32_t ulTaskNotifyTake(BaseType_t clear, TickType_t timeout) {
+    assert(clear == pdTRUE);
+    auto& task = *current_task;
+    std::unique_lock lock(task.mutex);
+    if (timeout == portMAX_DELAY) {
+        task.waiting = true;
+        task.changed.wait(lock, [&] { return task.notifications != 0; });
+        task.waiting = false;
+    } else assert(timeout == 0);
+    const auto result = task.notifications;
+    task.notifications = 0;
+    return result;
+}
 TickType_t xTaskGetTickCount() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - clock_start).count();
 }
-BaseType_t xTaskDelayUntil(TickType_t* last, TickType_t period) {
-    *last += period;
-    const auto now = xTaskGetTickCount();
-    if (*last <= now) return pdFALSE;
-    std::this_thread::sleep_for(std::chrono::milliseconds(*last - now));
-    return pdTRUE;
+std::int64_t esp_timer_get_time() {
+    if (const auto now = command_clock_us.load(); now >= 0) return now;
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - clock_start).count();
+}
+BaseType_t xTaskDelayUntil(TickType_t*, TickType_t) {
+    std::abort(); // The new worker must never use tick pacing.
+}
+
+esp_err_t gptimer_new_timer(const gptimer_config_t* config, gptimer_handle_t* out) {
+    assert(config->resolution_hz == 1000000 && config->direction == GPTIMER_COUNT_UP);
+    if (fail_timer_new.exchange(false)) return ESP_ERR_NOT_FOUND;
+    *out = new HostTimer;
+    ++timers;
+    return ESP_OK;
+}
+esp_err_t gptimer_register_event_callbacks(gptimer_handle_t timer,
+                                          const gptimer_event_callbacks_t* callbacks, void* context) {
+    assert(!timer->enabled);
+    if (fail_timer_register.exchange(false)) return ESP_FAIL;
+    timer->callback = callbacks->on_alarm;
+    timer->context = context;
+    return ESP_OK;
+}
+esp_err_t gptimer_set_alarm_action(gptimer_handle_t timer, const gptimer_alarm_config_t* alarm) {
+    assert(alarm->flags.auto_reload_on_alarm && alarm->reload_count == 0);
+    if (fail_timer_alarm.exchange(false)) return ESP_FAIL;
+    timer->period_us = alarm->alarm_count;
+    return ESP_OK;
+}
+esp_err_t gptimer_enable(gptimer_handle_t timer) {
+    assert(!timer->enabled && timer->callback && timer->period_us);
+    if (fail_timer_enable.exchange(false)) return ESP_FAIL;
+    timer->enabled = true;
+    if (fail_timer_enable_partial.exchange(false)) return ESP_FAIL;
+    return ESP_OK;
+}
+void emit_alarm(HostTimer* timer) {
+    const gptimer_alarm_event_data_t event{0,timer->period_us};
+    timer->callback(timer, &event, timer->context);
+}
+esp_err_t gptimer_start(gptimer_handle_t timer) {
+    assert(timer->enabled && !timer->running);
+    if (fail_timer_start.exchange(false)) return ESP_FAIL;
+    timer->running = true;
+    active_timer = timer;
+    if (!manual_timer) timer->thread = std::thread([timer] {
+        std::unique_lock lock(timer->mutex);
+        auto next = std::chrono::steady_clock::now() + std::chrono::microseconds(timer->period_us);
+        while (timer->running) {
+            if (timer->changed.wait_until(lock,next,[&] { return !timer->running; })) break;
+            lock.unlock();
+            emit_alarm(timer);
+            lock.lock();
+            next = std::chrono::steady_clock::now() + std::chrono::microseconds(timer->period_us);
+        }
+    });
+    return ESP_OK;
+}
+esp_err_t gptimer_stop(gptimer_handle_t timer) {
+    assert(timer->running);
+    {
+        std::lock_guard lock(timer->mutex);
+        timer->running = false;
+    }
+    timer->changed.notify_all();
+    if (timer->thread.joinable()) timer->thread.join();
+    active_timer = nullptr;
+    return ESP_OK;
+}
+esp_err_t gptimer_disable(gptimer_handle_t timer) {
+    if (!timer->enabled) return ESP_ERR_INVALID_STATE;
+    assert(!timer->running);
+    timer->enabled = false;
+    return ESP_OK;
+}
+esp_err_t gptimer_del_timer(gptimer_handle_t timer) {
+    assert(!timer->enabled && !timer->running);
+    delete timer;
+    --timers;
+    return ESP_OK;
 }
 
 extern "C" {
@@ -237,7 +373,11 @@ void test_codec() {
 void test_config_and_transport() {
     auto c = config();
     assert(validate_config(c) == ESP_OK);
-    c.frame_hz = 4000; assert(validate_config(c) == ESP_ERR_NOT_SUPPORTED);
+    for (const auto hz : {100u,1000u,2000u,3333u,4000u,8000u}) {
+        c.frame_hz = hz; assert(validate_config(c) == ESP_OK);
+    }
+    c.frame_hz = 8001; assert(validate_config(c) == ESP_ERR_NOT_SUPPORTED);
+    c.frame_hz = 0; assert(validate_config(c) == ESP_ERR_INVALID_ARG);
     c = config(); c.task_core = configNUMBER_OF_CORES; assert(validate_config(c) == ESP_ERR_INVALID_ARG);
     c = config(); c.signaling = Signaling::Bidirectional; assert(validate_config(c) == ESP_ERR_NOT_SUPPORTED);
     c.signaling = static_cast<Signaling>(42); assert(validate_config(c) == ESP_ERR_INVALID_ARG);
@@ -261,6 +401,7 @@ void test_config_and_transport() {
 
 void test_lifecycle() {
     Driver driver(config());
+    assert(!driver.statistics().running && driver.statistics().elapsed_us == 0);
     Link link(driver,GPIO_NUM_2);
     Link duplicate(driver,GPIO_NUM_2);
     assert(driver.start() == ESP_ERR_INVALID_STATE);
@@ -282,6 +423,10 @@ void test_lifecycle() {
         assert(driver.start() == ESP_OK);
         assert(driver.start() == ESP_ERR_INVALID_STATE);
         eventually([] { std::lock_guard lock(wire_mutex); return entered_wait; });
+        auto pending = driver.statistics();
+        assert(pending.running && pending.link_count == 1);
+        assert(pending.links[0].gpio == GPIO_NUM_2);
+        assert(pending.links[0].completed_frames == 0); // Submission is not completion.
         // Changing the pending request cannot rewrite the active RMT symbol buffer.
         assert(link.set(0) == ESP_OK);
         auto stopping = std::async(std::launch::async,[&] { driver.stop(); });
@@ -292,6 +437,20 @@ void test_lifecycle() {
         wire_changed.notify_all();
         assert(stopping.wait_for(2s) == std::future_status::ready);
         stopping.get();
+        const auto stopped = driver.statistics();
+        assert(!stopped.running && stopped.links[0].completed_frames == 1);
+        assert(stopped.links[0].tx_errors == 0 && stopped.elapsed_us >= 5000);
+        std::this_thread::sleep_for(1ms);
+        assert(driver.statistics().elapsed_us == stopped.elapsed_us); // Frozen after stop.
+#if CONFIG_DSHOT_TIMING_DIAGNOSTICS
+        assert(stopped.detailed_timing && stopped.links[0].tx_wait.count == 1);
+        assert(stopped.links[0].tx_wait.total_us >= 5000);
+        assert(stopped.worker_pass.total_us == stopped.outside_tx_wait.total_us +
+               stopped.links[0].tx_wait.total_us);
+        assert(stopped.links[0].completion_interval.count == 0);
+#else
+        assert(!stopped.detailed_timing && stopped.worker_pass.count == 0);
+#endif
         {
             std::lock_guard lock(wire_mutex);
             assert(wire_packets.size() == 1 && wire_packets.front() == 0x0606);
@@ -308,6 +467,16 @@ void test_lifecycle() {
     assert(driver.start() == ESP_OK);
     eventually([&] { return driver.last_error() == ESP_FAIL; });
     driver.stop(); link.end(); clean();
+    const auto faulted = driver.statistics();
+    assert(!faulted.running && faulted.links[0].tx_errors == 1);
+    assert(faulted.links[0].completed_frames == 0); // Retained after link.end().
+    assert(link.begin() == ESP_OK);
+    fail_wait = true;
+    assert(driver.start() == ESP_OK);
+    eventually([&] { return driver.last_error() == ESP_ERR_TIMEOUT; });
+    driver.stop(); link.end(); clean();
+    assert(driver.statistics().links[0].tx_errors == 1);
+    assert(driver.statistics().links[0].completed_frames == 0);
     assert(link.begin() == ESP_OK);
     assert(driver.start() == ESP_OK);
     assert(driver.last_error() == ESP_OK);
@@ -315,18 +484,230 @@ void test_lifecycle() {
     // Two distinct links are legal; duplicate GPIO and attachment while running are not.
     Link second(driver,GPIO_NUM_3);
     assert(link.begin() == ESP_OK && second.begin() == ESP_OK);
+    {
+        std::lock_guard lock(wire_mutex);
+        hold_wait = true; entered_wait = false;
+    }
     assert(driver.start() == ESP_OK);
+    eventually([] { std::lock_guard lock(wire_mutex); return entered_wait; });
+    std::this_thread::sleep_for(10ms); // Force missed slots without catching up.
+    {
+        std::lock_guard lock(wire_mutex);
+        hold_wait = false;
+    }
+    wire_changed.notify_all();
+    eventually([&] {
+        const auto snapshot = driver.statistics();
+        return snapshot.missed_slots >= 5 && snapshot.links[1].completed_frames >= 2;
+    });
+    const auto multiple = driver.statistics();
+    assert(multiple.link_count == 2 && multiple.links[1].gpio == GPIO_NUM_3);
+    assert(multiple.links[0].completed_frames >= multiple.links[1].completed_frames);
+    assert(multiple.links[0].completed_frames <= multiple.links[1].completed_frames + 1);
+    assert(multiple.links[0].tx_errors == 0 && multiple.links[1].tx_errors == 0);
+#if CONFIG_DSHOT_TIMING_DIAGNOSTICS
+    for (std::size_t i = 0; i < 2; ++i) {
+        const auto& stats = multiple.links[i];
+        assert(stats.completion_interval.count == stats.completed_frames - 1);
+        assert(stats.tx_wait.count == stats.completed_frames);
+        assert(stats.tx_wait.min_us <= stats.tx_wait.max_us);
+    }
+#endif
     Link late(driver,GPIO_NUM_4);
     assert(late.begin() == ESP_ERR_INVALID_STATE);
     second.end(); link.end(); clean();
 }
 
 void run_learning_checks();
+void run_command_sequence_tests();
+
+void test_command_integration() {
+    manual_timer = true;
+    command_clock_us = 1000000;
+    {
+        auto c = config(); c.frame_hz = 4000;
+        Driver driver(c);
+        Link link(driver,GPIO_NUM_2);
+        assert(link.begin() == ESP_OK);
+        assert(link.set(100) == ESP_OK);
+        assert(link.send_command(Command::DirectionNormal) == ESP_ERR_INVALID_STATE);
+        assert(link.set(0) == ESP_OK);
+        assert(link.send_command(Command::Beep1) == ESP_OK);
+        driver.stop(); // Cancels a queued command even before any worker exists.
+        assert(link.command_status().state == CommandState::Cancelled);
+        assert(driver.start() == ESP_OK);
+        eventually([] { return active_timer.load() && tasks.back()->waiting.load(); });
+        auto step = [&](std::int64_t now) {
+            command_clock_us = now;
+            const auto before = driver.statistics().worker_iterations;
+            emit_alarm(active_timer.load());
+            eventually([&] { return driver.statistics().worker_iterations > before && tasks.back()->waiting.load(); });
+        };
+        {
+            std::lock_guard lock(wire_mutex); wire_packets.clear();
+        }
+        assert(link.send_command(Command::DirectionNormal) == ESP_OK);
+        assert(link.set(200) == ESP_ERR_INVALID_STATE);
+        step(1000000);
+        step(1009999);
+        step(1010000);
+        assert(link.command_status().completed_repetitions == 1);
+        const auto completed = driver.statistics().links[0].completed_frames;
+        step(1010250);
+        assert(driver.statistics().links[0].completed_frames == completed);
+        assert(driver.statistics().links[0].command_pauses == 1);
+        for (unsigned i = 1; i < 6; ++i) step(1010000 + i*1000);
+        step(1015999);
+        assert(link.command_status().state == CommandState::Cooldown);
+        step(1016000);
+        assert(link.command_status().state == CommandState::Complete);
+        {
+            std::lock_guard lock(wire_mutex);
+            assert(wire_packets.size() == 10);
+            for (unsigned i = 0; i < 10; ++i) {
+                assert(wire_packets[i] == (i >= 2 && i < 8 ? 0x029B : 0));
+            }
+        }
+        assert(link.send_command(Command::Beep1) == ESP_OK);
+        step(1020000);
+        {
+            std::lock_guard lock(wire_mutex); hold_wait = true; entered_wait = false;
+        }
+        command_clock_us = 1030000;
+        emit_alarm(active_timer.load());
+        eventually([] { std::lock_guard lock(wire_mutex); return entered_wait; });
+        assert(link.command_status().completed_repetitions == 0);
+        assert(link.set(0) == ESP_OK); // Cancel during RMT's active frame.
+        assert(link.send_command(Command::Direction2) == ESP_ERR_INVALID_STATE);
+        {
+            std::lock_guard lock(wire_mutex); hold_wait = false;
+        }
+        wire_changed.notify_all();
+        eventually([] { return tasks.back()->waiting.load(); });
+        assert(link.command_status().state == CommandState::Cancelled);
+        assert(link.command_status().completed_repetitions == 1);
+        assert(link.set(100) == ESP_ERR_INVALID_STATE); // Already-sent beep retains its cooldown.
+        command_clock_us = 1290001;
+        assert(link.set(100) == ESP_OK);
+        assert(link.set(0) == ESP_OK);
+        assert(link.send_command(Command::SaveSettings) == ESP_OK);
+        step(1300000);
+        fail_wait = true;
+        command_clock_us = 1310000;
+        emit_alarm(active_timer.load());
+        eventually([&] { return driver.last_error() == ESP_ERR_TIMEOUT; });
+        driver.stop();
+        assert(link.command_status().state == CommandState::Failed);
+        assert(link.command_status().completed_repetitions == 0);
+        link.end();
+        assert(link.command_status().state == CommandState::Failed);
+        clean();
+        assert(link.begin() == ESP_OK && driver.start() == ESP_OK);
+        assert(link.send_command(Command::Direction2) == ESP_OK);
+        driver.stop();
+        assert(link.command_status().state == CommandState::Cancelled);
+        link.end(); clean();
+    }
+    {
+        Driver driver(config());
+        Link command_link(driver,GPIO_NUM_2), other(driver,GPIO_NUM_3);
+        assert(command_link.begin() == ESP_OK && other.begin() == ESP_OK);
+        assert(other.set(100) == ESP_OK);
+        assert(command_link.send_command(Command::Direction1) == ESP_OK);
+        assert(driver.start() == ESP_OK);
+        eventually([] { return active_timer.load() && tasks.back()->waiting.load(); });
+        auto step = [&](std::int64_t now) {
+            command_clock_us = now;
+            const auto before = driver.statistics().worker_iterations;
+            emit_alarm(active_timer.load());
+            eventually([&] { return driver.statistics().worker_iterations > before && tasks.back()->waiting.load(); });
+        };
+        step(2000000); // Command preamble, other link's ordinary payload.
+        step(2010000); // First command frame.
+        const auto before = driver.statistics();
+        step(2010250); // Command gap must not pause the other link.
+        const auto after = driver.statistics();
+        assert(after.links[0].completed_frames == before.links[0].completed_frames);
+        assert(after.links[0].command_pauses == 1);
+        assert(after.links[1].completed_frames == before.links[1].completed_frames + 1);
+        assert(after.links[1].command_pauses == 0);
+        driver.stop(); command_link.end(); other.end(); clean();
+    }
+    command_clock_us = -1;
+    manual_timer = false;
+}
+
+void test_scheduler() {
+    // Setup failures release partial timer state, and retry on the same link works.
+    for (auto* failure : {&fail_timer_new,&fail_timer_register,&fail_timer_alarm,
+                          &fail_timer_enable,&fail_timer_enable_partial}) {
+        Driver driver(config());
+        Link link(driver,GPIO_NUM_2);
+        assert(link.begin() == ESP_OK);
+        failure->store(true);
+        assert(driver.start() != ESP_OK && timers == 0);
+        assert(driver.start() == ESP_OK);
+        link.end(); clean();
+    }
+    {
+        Driver driver(config());
+        Link link(driver,GPIO_NUM_2);
+        assert(link.begin() == ESP_OK);
+        fail_timer_start = true;
+        assert(driver.start() == ESP_OK);
+        eventually([&] { return driver.last_error() == ESP_FAIL; });
+        driver.stop();
+        assert(timers == 0 && driver.statistics().links[0].completed_frames == 0);
+        assert(driver.start() == ESP_OK);
+        link.end(); clean();
+    }
+
+    // Drive alarms explicitly: host thread scheduling is not a timing benchmark.
+    manual_timer = true;
+    for (const auto hz : {1000u,2000u,4000u,8000u,3333u,1u}) {
+        auto c = config(); c.frame_hz = hz;
+        Driver driver(c);
+        Link link(driver,GPIO_NUM_2);
+        assert(link.begin() == ESP_OK && driver.start() == ESP_OK);
+        eventually([] { return active_timer.load() != nullptr; });
+        auto* timer = active_timer.load();
+        assert(timer->period_us == (1000000u + hz/2) / hz);
+        assert(driver.statistics().timer_period_us == timer->period_us);
+        {
+            std::lock_guard lock(wire_mutex);
+            hold_wait = true; entered_wait = false;
+        }
+        emit_alarm(timer);
+        eventually([] { std::lock_guard lock(wire_mutex); return entered_wait; });
+        // Seven alarms while TX is blocked must not produce seven catch-up frames.
+        for (unsigned i = 0; i < 7; ++i) emit_alarm(timer);
+        {
+            std::lock_guard lock(wire_mutex);
+            hold_wait = false;
+        }
+        wire_changed.notify_all();
+        eventually([&] { return driver.statistics().missed_slots == 7; });
+        std::this_thread::sleep_for(2ms);
+        assert(driver.statistics().links[0].completed_frames == 1);
+        emit_alarm(timer);
+        eventually([&] { return driver.statistics().links[0].completed_frames == 2; });
+        // No more alarms are forthcoming. stop must explicitly wake the worker.
+        auto stopped = std::async(std::launch::async,[&] { driver.stop(); });
+        assert(stopped.wait_for(200ms) == std::future_status::ready);
+        stopped.get();
+        link.end(); clean();
+    }
+    manual_timer = false;
+}
 
 int main() {
     run_learning_checks();
     test_codec(); std::puts("PASS: packet, bit order, all bitrates, timing and symbol validation");
     test_config_and_transport(); std::puts("PASS: configuration, partial setup rollback, timeout abort and close");
-    test_lifecycle(); std::puts("PASS: restart, duplicate GPIO, task/TX failures, buffer lifetime and stop handshake");
+    test_lifecycle(); std::puts("PASS: lifecycle, statistics reset/retention, multi-link counts and missed slots");
+    test_scheduler(); std::puts("PASS: GPTimer rollback/restart, 1/2/4/8 kHz periods at 100 Hz RTOS tick, dropped backlog, stop wake-up");
+    run_command_sequence_tests();
+    test_command_integration();
+    std::puts("PASS: command packets, completed repetitions, quiet gaps, cancellation, cooldowns and faults");
     clean();
 }

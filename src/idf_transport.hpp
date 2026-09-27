@@ -29,7 +29,8 @@ struct RmtTransport {
 };
 
 esp_err_t open_transport(RmtTransport& transport, gpio_num_t gpio, const Config& config);
-esp_err_t send_packet(RmtTransport& transport, std::uint16_t packet);
+esp_err_t send_packet(RmtTransport& transport, std::uint16_t packet,
+                      std::uint64_t* wait_us = nullptr);
 esp_err_t close_transport(RmtTransport& transport);
 // Never allow storage to be freed if hardware ownership could not be retired.
 void close_transport_or_abort(RmtTransport& transport);

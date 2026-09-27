@@ -7,7 +7,10 @@ endif()
 idf_component_register(
     SRCS
         "src/config.cpp"
+        "src/command.cpp"
+        "src/command_sequence.cpp"
         "src/driver.cpp"
+        "src/frame_scheduler.cpp"
         "src/link.cpp"
         "src/frame_codec.cpp"
         "src/telemetry_codec.cpp"

@@ -24,10 +24,11 @@ menu "DShot"
         help
             The first tutorial implements regular DShot. Bidirectional signaling
             requires output release and a bounded reply window before use.
+            Bidirectional mode currently returns ESP_ERR_NOT_SUPPORTED.
         config DSHOT_DEFAULT_REGULAR
-            bool "Regular"
+            bool "Regular (uninverted)"
         config DSHOT_DEFAULT_BIDIRECTIONAL
-            bool "Bidirectional (requires later implementation)"
+            bool "Bidirectional (inverted)"
     endchoice
 
     config DSHOT_DEFAULT_FRAME_HZ
@@ -37,7 +38,9 @@ menu "DShot"
         help
             A constructor default, not a promise that every bitrate/signaling
             combination fits. The driver must validate the complete exchange.
-            Start the proof of concept at 1000 Hz; 4000 Hz is the later target.
+            GPTimer wakes the worker independently of the FreeRTOS tick rate.
+            The period is rounded to the nearest microsecond; 1000, 2000, 4000,
+            and 8000 Hz are exact. Start at 1000 Hz, then measure higher rates.
 
     config DSHOT_DEFAULT_TASK_PRIORITY
         int "Default worker task priority"
@@ -69,9 +72,12 @@ menu "DShot"
             This setting does not enable reception or EDT in the proof of concept.
 
     config DSHOT_TIMING_DIAGNOSTICS
-        bool "Compile detailed timing instrumentation (future implementation)"
+        bool "Compile detailed timing instrumentation"
         default n
         help
-            Reserved build option for extra internal timing measurements.
-            Basic error/frame counters should remain available without it.
+            Record elapsed microseconds inside and outside TX waits, worker-pass
+            duration, and intervals between observed completions. These timings
+            include task preemption; they do not measure CPU usage or GPIO edges.
+            Read them through Driver::statistics() or the bench stats command.
+            Frame/error and missed-slot counters remain available without this.
 endmenu

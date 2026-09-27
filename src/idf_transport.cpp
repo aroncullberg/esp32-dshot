@@ -3,6 +3,10 @@
 
 #include <cstdlib>
 #include "esp_log.h"
+#include "sdkconfig.h"
+#if CONFIG_DSHOT_TIMING_DIAGNOSTICS
+#include "esp_timer.h"
+#endif
 
 namespace dshot::detail {
 namespace {
@@ -59,7 +63,9 @@ esp_err_t open_transport(RmtTransport& transport, gpio_num_t gpio, const Config&
     return ESP_OK;
 }
 
-esp_err_t send_packet(RmtTransport& transport, std::uint16_t packet) {
+esp_err_t send_packet(RmtTransport& transport, std::uint16_t packet,
+                      std::uint64_t* wait_us) {
+    if (wait_us) *wait_us = 0;
     if (!transport.opened || !transport.enabled || transport.faulted || transport.in_flight) {
         return ESP_ERR_INVALID_STATE;
     }
@@ -79,7 +85,13 @@ esp_err_t send_packet(RmtTransport& transport, std::uint16_t packet) {
         return error;
     }
     transport.in_flight = true;
+#if CONFIG_DSHOT_TIMING_DIAGNOSTICS
+    const auto wait_started = esp_timer_get_time();
+#endif
     error = rmt_tx_wait_all_done(transport.tx_channel, kTxTimeoutMs);
+#if CONFIG_DSHOT_TIMING_DIAGNOSTICS
+    if (wait_us) *wait_us = esp_timer_get_time() - wait_started;
+#endif
     if (error != ESP_OK) {
         transport.faulted = true;
         require_disabled(rmt_disable(transport.tx_channel));

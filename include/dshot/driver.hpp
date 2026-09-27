@@ -1,6 +1,7 @@
 #pragma once
 
 #include "dshot/config.hpp"
+#include "dshot/statistics.hpp"
 #include "esp_err.h"
 
 namespace dshot {
@@ -17,6 +18,9 @@ public:
     void stop();
     // Last asynchronous TX error; reset when a new worker starts successfully.
     esp_err_t last_error() const;
+    // Coherent snapshot, safe alongside the worker. Serialize with lifecycle calls.
+    // Reset on start; retained after stop, faults, and link teardown.
+    DriverStatistics statistics() const;
 
     Driver(const Driver&) = delete;
     Driver& operator=(const Driver&) = delete;
@@ -28,7 +32,7 @@ private:
     esp_err_t prepare_link(const Link& link);
     esp_err_t attach_link(Link& link);
     void detach_link(Link& link);
-    esp_err_t send_once();
+    esp_err_t send_once(std::uint64_t& wait_us);
     static void worker_entry(void* argument);
     void worker_loop();
 
