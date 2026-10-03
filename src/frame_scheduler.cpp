@@ -37,7 +37,7 @@ esp_err_t FrameScheduler::open(unsigned frame_hz) {
         error = gptimer_enable(timer_);
         if (error == ESP_OK) enabled_ = true;
         else {
-            // IDF can enter its enabled state before interrupt/PM setup fails.
+            // gptimer_enable() can fail after enabling the timer.
             const auto cleanup = gptimer_disable(timer_);
             if (cleanup != ESP_ERR_INVALID_STATE) require_cleanup(cleanup);
         }
@@ -75,7 +75,6 @@ void FrameScheduler::wake() {
 }
 
 void FrameScheduler::close() {
-    // Neither stop() nor a late callback may notify a task after it exits.
     portENTER_CRITICAL(&wake_lock_);
     wake_task_ = nullptr;
     portEXIT_CRITICAL(&wake_lock_);

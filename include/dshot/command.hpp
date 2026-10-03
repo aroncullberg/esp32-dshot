@@ -24,7 +24,7 @@ struct CommandInfo {
     std::uint32_t post_delay_us;
     std::uint32_t repeat_interval_us = 1000;
 };
-// Null for reserved/unsupported IDs. Describes transmission, not ESC capability.
+// Returns nullptr for unlisted command IDs.
 const CommandInfo* command_info(Command command);
 
 enum class CommandState { Idle, Pending, Preparing, Transmitting, Cooldown, Complete, Cancelled, Failed };

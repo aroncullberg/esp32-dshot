@@ -42,7 +42,7 @@ struct Driver::Impl {
     std::size_t link_count = 0;
     detail::FrameScheduler scheduler;
     SemaphoreHandle_t worker_exited = nullptr;
-    bool join_pending = false; // Accessed only by serialized lifecycle calls.
+    bool join_pending = false;
     std::atomic<bool> stop_requested{false};
     std::atomic<esp_err_t> last_error{ESP_OK};
     portMUX_TYPE statistics_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -66,6 +66,7 @@ Driver::~Driver() {
 }
 
 esp_err_t Driver::prepare_link(const Link& link) {
+    if (passthrough_owner_) return ESP_ERR_INVALID_STATE;
     const auto error = validate_config(config_);
     if (error != ESP_OK) return error;
     if (!GPIO_IS_VALID_OUTPUT_GPIO(link.pin_)) return ESP_ERR_INVALID_ARG;
@@ -81,6 +82,26 @@ esp_err_t Driver::prepare_link(const Link& link) {
         }
     }
     return impl_->link_count == kMaxLinks ? ESP_ERR_NOT_FOUND : ESP_OK;
+}
+
+esp_err_t Driver::validate_passthrough_links(Link* const* links, std::size_t count) const {
+    if (!links || count == 0 || count > kMaxLinks) return ESP_ERR_INVALID_ARG;
+    for (std::size_t i = 0; i < count; ++i) {
+        if (!links[i] || &links[i]->driver_ != this) return ESP_ERR_INVALID_ARG;
+        for (std::size_t j = 0; j < i; ++j) {
+            if (links[j] == links[i] || links[j]->pin_ == links[i]->pin_)
+                return ESP_ERR_INVALID_ARG;
+        }
+    }
+    if (impl_) {
+        for (std::size_t i = 0; i < impl_->link_count; ++i) {
+            bool included = false;
+            for (std::size_t j = 0; j < count; ++j)
+                if (impl_->links[i] == links[j]) included = true;
+            if (!included) return ESP_ERR_INVALID_STATE;
+        }
+    }
+    return ESP_OK;
 }
 
 esp_err_t Driver::attach_link(Link& link) {
@@ -108,6 +129,7 @@ void Driver::detach_link(Link& link) {
 }
 
 esp_err_t Driver::start() {
+    if (passthrough_owner_) return ESP_ERR_INVALID_STATE;
     const auto error = validate_config(config_);
     if (error != ESP_OK) return error;
     if (!impl_ || impl_->link_count == 0 || impl_->join_pending) return ESP_ERR_INVALID_STATE;
@@ -161,7 +183,6 @@ void Driver::stop() {
     }
     impl_->stop_requested.store(true);
     impl_->scheduler.wake();
-    // The worker finishes/aborts its active TX and acknowledges its last owner access.
     if (xSemaphoreTake(impl_->worker_exited, portMAX_DELAY) != pdTRUE) std::abort();
     impl_->join_pending = false;
 }
@@ -191,11 +212,12 @@ esp_err_t Driver::send_once(std::uint64_t& wait_us) {
         const auto started = esp_timer_get_time();
 #endif
         bool transmitted = false;
-        const auto error = impl_->links[i]->transmit_pending(&link_wait_us, transmitted);
+        std::uint64_t rx_wait_us = 0;
+        const auto error = impl_->links[i]->transmit_pending(&link_wait_us, transmitted, rx_wait_us);
 #if CONFIG_DSHOT_TIMING_DIAGNOSTICS
         const auto completed = esp_timer_get_time();
 #endif
-        wait_us += link_wait_us;
+        wait_us += link_wait_us + rx_wait_us;
         portENTER_CRITICAL(&impl_->statistics_lock);
         auto& link = impl_->statistics.links[i];
         if (transmitted) ++link.completed_frames;
@@ -205,6 +227,7 @@ esp_err_t Driver::send_once(std::uint64_t& wait_us) {
         if (transmitted || error != ESP_OK) {
             record(link.outside_tx_wait, completed - started - link_wait_us);
             record(link.tx_wait, link_wait_us);
+            if (config_.signaling == Signaling::Bidirectional) record(link.rx_wait, rx_wait_us);
         }
         if (transmitted) {
             if (link.completed_frames > 1) {
@@ -221,7 +244,7 @@ esp_err_t Driver::send_once(std::uint64_t& wait_us) {
 
 void Driver::worker_entry(void* argument) {
     static_cast<Driver*>(argument)->worker_loop();
-    vTaskDelete(nullptr); // No access to the Driver after the exit acknowledgement.
+    vTaskDelete(nullptr); // stop() can return before this task deletes itself.
 }
 
 void Driver::worker_loop() {
@@ -233,7 +256,6 @@ void Driver::worker_loop() {
         }
     }
     while (!impl_->stop_requested.load() && impl_->last_error.load() == ESP_OK) {
-        // Consume all notifications together: one current frame, no backlog.
         const auto alarms = ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         if (impl_->stop_requested.load()) break;
         if (alarms == 0) continue;
@@ -261,10 +283,9 @@ void Driver::worker_loop() {
             break;
         }
         if (impl_->stop_requested.load()) break;
-        // Alarms delivered during this transmission pass are already stale.
-        // Retire them, then block for the next alarm instead of transmitting again.
+        // Skip missed slots to avoid a burst of catch-up frames.
         const auto skipped = ulTaskNotifyTake(pdTRUE, 0);
-        if (impl_->stop_requested.load()) break; // A stop wake-up is not a missed slot.
+        if (impl_->stop_requested.load()) break;
         portENTER_CRITICAL(&impl_->statistics_lock);
         impl_->statistics.missed_slots += skipped;
         portEXIT_CRITICAL(&impl_->statistics_lock);

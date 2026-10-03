@@ -19,3 +19,4 @@ using portMUX_TYPE = std::mutex;
 #define pdPASS 1
 #define portMAX_DELAY UINT32_MAX
 #define tskNO_AFFINITY (-1)
+#define pdMS_TO_TICKS(ms) ((ms) * configTICK_RATE_HZ / 1000)

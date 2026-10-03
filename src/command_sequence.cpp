@@ -59,14 +59,14 @@ void CommandSequence::complete(const CommandFrame& frame, esp_err_t error, std::
     }
     if (frame.preamble && status_.state == CommandState::Pending) {
         status_.state = CommandState::Preparing;
-        ready_at_us_ = now + 10000; // Start the zero preamble from an actual completion.
+        ready_at_us_ = now + 10000;
     }
     if (!frame.command) return;
     if (status_.completed_repetitions == status_.total_repetitions) {
         status_.state = CommandState::Cooldown;
         ready_at_us_ = next_command_at_us_;
     } else {
-        ready_at_us_ = now + info_->repeat_interval_us; // No zero/throttle frames between repetitions.
+        ready_at_us_ = now + info_->repeat_interval_us; // Command repetitions have no intervening zero or throttle frames.
     }
 }
 void CommandSequence::cancel() {

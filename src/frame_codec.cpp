@@ -87,7 +87,6 @@ namespace dshot::detail {
     }
 
     esp_err_t encode_regular_symbols(std::uint16_t packet, const BitTiming &timing, SymbolFrame &symbols_out) {
-        // Validate before writing anything: invalid input must preserve the array.
         constexpr std::uint32_t max_duration_ticks = 32767;
         if (timing.bit_0_high_ticks == 0 || timing.bit_0_low_ticks == 0 ||
             timing.bit_1_high_ticks == 0 || timing.bit_1_low_ticks == 0 ||

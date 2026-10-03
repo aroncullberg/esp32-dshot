@@ -26,6 +26,11 @@ namespace dshot {
             unsigned task_priority;
             unsigned task_stack_bytes;
             int task_core;
+            unsigned motor_poles; // Even magnetic pole count from 2 to 254.
             unsigned erpm_max_age_us;
+            unsigned edt_max_age_us;
+            unsigned edt_version; // Version 1 reports debug3. Version 2 reports stress and counts status events. (BIG MAYBE ON THIS)
+            unsigned edt_response_timeout_ms;
+            unsigned edt_attempts;
     };
 }

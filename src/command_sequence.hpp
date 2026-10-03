@@ -10,7 +10,6 @@ struct CommandFrame {
     bool preamble = false;
 };
 
-// Pure state machine. The owning Link serializes access and supplies time.
 class CommandSequence {
 public:
     esp_err_t begin(Command command, std::int64_t now);

@@ -17,7 +17,7 @@
 #include "freertos/task.h"
 
 namespace {
-enum class Action { Arm, Run, Stop, Stats, EscCommand, CommandStatus };
+enum class Action { Arm, Run, Stop, Stats, EscCommand, CommandStatus, Telemetry, TelemetryRaw, Edt };
 struct Command {
     Action action;
     std::uint16_t payload = 0;
@@ -43,6 +43,81 @@ int stop_command(int argc, char**) {
 int stats_command(int argc, char**) {
     if (argc != 1) { std::puts("stats"); return 1; }
     return enqueue({Action::Stats});
+}
+
+int telemetry_command(int argc, char** argv) {
+    if (argc == 1) return enqueue({Action::Telemetry});
+    if (argc == 2 && std::strcmp(argv[1],"raw") == 0) return enqueue({Action::TelemetryRaw});
+    std::puts("telemetry [raw]");
+    return 1;
+}
+int edt_command(int argc, char** argv) {
+    if (argc == 1 || (argc == 2 && std::strcmp(argv[1],"status") == 0))
+        return enqueue({Action::Telemetry});
+    if (argc == 2 && std::strcmp(argv[1],"on") == 0) return enqueue({Action::Edt,1});
+    if (argc == 2 && std::strcmp(argv[1],"off") == 0) return enqueue({Action::Edt,0});
+    std::puts("edt <on|off|status>");
+    return 1;
+}
+
+void print_receive_stats(const dshot::Telemetry& data) {
+    if (!data.available) return;
+    const auto& c = data.counters;
+    std::printf("RX: replies %" PRIu64 " | no response %" PRIu64 " | malformed %" PRIu64
+                " | GCR %" PRIu64 " | CRC %" PRIu64 " | overflow %" PRIu64 " | errors %" PRIu64 "\n",
+                c.replies,c.no_response,c.malformed,c.gcr_errors,c.checksum_errors,c.overflows,c.receive_errors);
+}
+void print_capture(const dshot::ReceiveCapture& capture) {
+    if (!capture.pulse_count) { std::puts("RX capture: no data"); return; }
+    const char* result = "unknown";
+    switch (capture.result) {
+    case dshot::ReceiveResult::Valid: result = "valid"; break;
+    case dshot::ReceiveResult::NoResponse: result = "no response"; break;
+    case dshot::ReceiveResult::Malformed: result = "malformed"; break;
+    case dshot::ReceiveResult::GcrError: result = "GCR error"; break;
+    case dshot::ReceiveResult::ChecksumError: result = "CRC error"; break;
+    case dshot::ReceiveResult::Overflow: result = "overflow"; break;
+    case dshot::ReceiveResult::ReceiveError: result = "receive error"; break;
+    }
+    std::printf("RX capture: %s | age %.1f ms | clock %" PRIu32 " Hz | D%" PRIu32 "\n",
+        result, (esp_timer_get_time()-capture.captured_at_us)/1000.0,
+        capture.resolution_hz, capture.bitrate/1000);
+    std::puts("  level:duration_ticks (0 duration = end marker)");
+    for (unsigned i = 0; i < capture.pulse_count; ++i) {
+        const auto& pulse = capture.pulses[i];
+        std::printf(" %u:%u", pulse.high ? 1u : 0u, static_cast<unsigned>(pulse.ticks));
+        if (i%8 == 7 || i+1 == capture.pulse_count) std::putchar('\n');
+    }
+}
+
+void print_telemetry(const dshot::Telemetry& data) {
+    if (!data.available) { std::puts("telemetry: select bidirectional signaling and arm"); return; }
+    const auto now = esp_timer_get_time();
+    const auto& speed = data.speed;
+    std::printf("eRPM: %s", dshot::erpm_state_name(speed.state));
+    if (speed.state != dshot::ErpmState::NoData)
+        std::printf(" | %" PRIu32 " electrical RPM | %" PRIu32 " motor RPM (%u poles) | period %" PRIu32 " us | age %.1f ms",
+                    speed.erpm,speed.rpm,speed.motor_poles,speed.period_us,(now-speed.updated_at_us)/1000.0);
+    std::printf("\nEDT: %s | layout v%u | attempts %u\n", dshot::edt_state_name(data.edt.state),
+                data.edt.interpretation_version,data.edt.attempts);
+    auto field = [&](const char* name, const dshot::TelemetryField& value, const char* unit) {
+        if (!value.valid) return;
+        std::printf("  %s: %" PRIu32 " %s | age %.1f ms%s\n",name,value.value,unit,
+                    (now-value.updated_at_us)/1000.0,value.fresh ? "" : " | stale");
+    };
+    field("acknowledgement",data.edt.acknowledgement,"raw");
+    field("temperature",data.temperature_c,"C");
+    field("voltage",data.voltage_mv,"mV");
+    field("current",data.current_ma,"mA");
+    field("debug1",data.debug1,"raw"); field("debug2",data.debug2,"raw");
+    field("debug3",data.debug3,"raw"); field("stress",data.stress,"/255");
+    field("status",data.status,"raw"); field("unknown",data.unknown,"raw payload");
+    field("last payload",data.last_payload,"raw");
+    if (data.status.valid && data.edt.interpretation_version == 2 && data.status.value != 255)
+        std::printf("  status: alert %" PRIu32 " | warning %" PRIu32 " | error %" PRIu32 " | max stress %" PRIu32 "/15\n",
+                    (data.status.value >> 7)&1,(data.status.value >> 6)&1,
+                    (data.status.value >> 5)&1,data.status.value&15);
+    print_receive_stats(data);
 }
 
 int beep_command(int argc, char** argv) {
@@ -127,12 +202,13 @@ void print_statistics(const dshot::DriverStatistics& current,
         if (current.detailed_timing) {
             print_timing("outside TX wait", link.outside_tx_wait);
             print_timing("TX wait", link.tx_wait);
+            print_timing("RX wait/decode", link.rx_wait);
             print_timing("completion interval", link.completion_interval);
         }
     }
     if (current.detailed_timing) {
         print_timing("worker pass", current.worker_pass);
-        print_timing("worker outside TX waits", current.outside_tx_wait);
+        print_timing("worker outside TX/RX waits", current.outside_tx_wait);
     }
 }
 
@@ -209,7 +285,7 @@ void bench_worker(void*) {
                 if (error == ESP_OK) {
                     opened = true;
                     previous_statistics = {};
-                    error = driver.start(); // A freshly opened link starts with zero pending.
+                    error = driver.start();
                 }
                 if (error != ESP_OK) {
                     std::printf("arm: %s\n", esp_err_to_name(error));
@@ -245,6 +321,7 @@ void bench_worker(void*) {
         case Action::Stats: {
             const auto snapshot = driver.statistics();
             print_statistics(snapshot, previous_statistics);
+            print_receive_stats(link.telemetry());
             previous_statistics = snapshot;
             break;
         }
@@ -262,6 +339,21 @@ void bench_worker(void*) {
         case Action::CommandStatus:
             print_command_status(link.command_status());
             break;
+        case Action::Telemetry:
+            print_telemetry(link.telemetry());
+            break;
+        case Action::TelemetryRaw:
+            print_capture(link.receive_capture());
+            break;
+        case Action::Edt: {
+            if (!opened) { std::puts("arm first"); break; }
+            if (arm_until_us) { std::puts("wait until armed"); break; }
+            if (requested_payload) { std::puts("stop first"); break; }
+            const auto error = link.request_edt(command.payload != 0);
+            if (error == ESP_OK) std::puts(command.payload ? "EDT enable queued" : "EDT disable queued");
+            else std::printf("EDT: %s\n",esp_err_to_name(error));
+            break;
+        }
         }
     }
 }
@@ -270,7 +362,7 @@ void bench_worker(void*) {
 extern "C" void app_main() {
     commands = xQueueCreate(8, sizeof(Command));
     if (!commands) { std::puts("command queue allocation failed"); return; }
-    if (xTaskCreate(bench_worker, "dshot_bench", 4096, nullptr, 5, nullptr) != pdPASS) {
+    if (xTaskCreate(bench_worker, "dshot_bench", 8192, nullptr, 5, nullptr) != pdPASS) {
         vQueueDelete(commands);
         std::puts("bench task creation failed");
         return;
@@ -288,7 +380,11 @@ extern "C" void app_main() {
     register_command("direction", "direction <normal|reversed|1|2>", direction_command);
     register_command("save", "Save ESC settings", save_command);
     register_command("command", "command <name|id|list|status>", esc_command);
+    register_command("telemetry", "Show eRPM/EDT and counters; telemetry raw shows captured pulses", telemetry_command);
+    register_command("edt", "edt <on|off|status>", edt_command);
     std::printf("GPIO %d | DShot%d | %d Hz\n", CONFIG_DSHOT_BENCH_GPIO,
                 CONFIG_DSHOT_DEFAULT_BITRATE / 1000, CONFIG_DSHOT_DEFAULT_FRAME_HZ);
+    std::puts(dshot::Config{}.signaling == dshot::Signaling::Bidirectional ?
+              "Bidirectional (inverted)" : "Regular (uninverted)");
     ESP_ERROR_CHECK(esp_console_start_repl(repl));
 }

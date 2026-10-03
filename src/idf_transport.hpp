@@ -4,12 +4,15 @@
 #include "driver/gpio.h"
 #include "driver/rmt_encoder.h"
 #include "driver/rmt_tx.h"
+#include "driver/rmt_rx.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "frame_codec.hpp"
+#include "telemetry_codec.hpp"
 
 namespace dshot::detail {
 inline constexpr std::uint32_t kRMTResolutionHz = 40'000'000;
 
-// Task-context operations on this state must be serialized. Close before destroy.
 struct RmtTransport {
     RmtTransport() = default;
     RmtTransport(const RmtTransport&) = delete;
@@ -26,12 +29,26 @@ struct RmtTransport {
     bool faulted = false;
     BitTiming timing{};
     SymbolFrame symbols{};
+    bool bidirectional = false;
+    unsigned bitrate = 0;
+    rmt_channel_handle_t rx_channel = nullptr;
+    bool rx_enabled = false;
+    SemaphoreHandle_t rx_done = nullptr;
+    portMUX_TYPE rx_lock = portMUX_INITIALIZER_UNLOCKED;
+    // rx_lock protects accept_rx, rx_error, and rx_count.
+    bool accept_rx = false;
+    esp_err_t rx_error = ESP_OK;
+    std::size_t rx_count = 0;
+    rmt_symbol_word_t rx_symbols[32]{};
+    rmt_receive_config_t receive_config{};
+    DecodedReply reply;
+    std::uint64_t rx_wait_us = 0;
 };
 
 esp_err_t open_transport(RmtTransport& transport, gpio_num_t gpio, const Config& config);
 esp_err_t send_packet(RmtTransport& transport, std::uint16_t packet,
                       std::uint64_t* wait_us = nullptr);
 esp_err_t close_transport(RmtTransport& transport);
-// Never allow storage to be freed if hardware ownership could not be retired.
+// Failed cleanup may leave callbacks pointing into the transport.
 void close_transport_or_abort(RmtTransport& transport);
 }

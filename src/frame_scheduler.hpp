@@ -6,8 +6,7 @@
 #include "freertos/task.h"
 
 namespace dshot::detail {
-// One timer per driver. Open before launching the worker; start/close in the
-// worker. After worker exit, the owner may open it again. wake() is concurrent.
+// wake() can run concurrently with start() and close().
 class FrameScheduler {
 public:
     FrameScheduler() = default;

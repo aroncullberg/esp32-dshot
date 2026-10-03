@@ -19,18 +19,18 @@ void run_command_sequence_tests() {
         sequence.complete(preamble, ESP_OK, 50);
         assert(sequence.select(0,10049).body == 0);
         std::int64_t now = 10050;
-        for (unsigned i = 0; i < 6; ++i) {
+        for (unsigned i = 0; i < 10; ++i) {
             const auto frame = sequence.select(0,now);
             assert(frame.send && frame.command);
             assert(frame.body == ((static_cast<unsigned>(command) << 1) | 1u));
             assert(sequence.status().completed_repetitions == i);
             sequence.complete(frame, ESP_OK, now + 50);
             assert(sequence.status().completed_repetitions == i + 1);
-            if (i != 5) assert(!sequence.select(0,now + 1049).send);
+            if (i != 9) assert(!sequence.select(0,now + 1049).send);
             now += 1050;
         }
         const auto status = sequence.status();
-        assert(status.state == CommandState::Cooldown && status.total_repetitions == 6);
+        assert(status.state == CommandState::Cooldown && status.total_repetitions == 10);
         const auto end = status.last_completed_us + (command == Command::SaveSettings ? 35000 : 1000);
         assert(sequence.select(0,end-1).body == 0);
         assert(sequence.begin(Command::Beep1,end-1) == ESP_ERR_INVALID_STATE);
@@ -60,7 +60,7 @@ void run_command_sequence_tests() {
     assert(cancelled.begin(Command::Direction1,10001) == ESP_ERR_INVALID_STATE);
     cancelled.complete(frame,ESP_OK,10050);
     assert(cancelled.status().state == CommandState::Cancelled);
-    assert(cancelled.status().completed_repetitions == 1); // The in-flight frame did finish.
+    assert(cancelled.status().completed_repetitions == 1);
     assert(cancelled.busy(270049) && !cancelled.busy(270050));
     assert(cancelled.begin(Command::Direction1,270050) == ESP_OK);
     const auto new_id = cancelled.status().id;

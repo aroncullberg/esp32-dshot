@@ -43,7 +43,12 @@ namespace dshot {
             task_priority(CONFIG_DSHOT_DEFAULT_TASK_PRIORITY),
             task_stack_bytes(CONFIG_DSHOT_DEFAULT_TASK_STACK_BYTES),
             task_core(CONFIG_DSHOT_DEFAULT_TASK_CORE),
-            erpm_max_age_us(CONFIG_DSHOT_DEFAULT_ERPM_MAX_AGE_US) { }
+            motor_poles(CONFIG_DSHOT_DEFAULT_MOTOR_POLES),
+            erpm_max_age_us(CONFIG_DSHOT_DEFAULT_ERPM_MAX_AGE_US),
+            edt_max_age_us(CONFIG_DSHOT_DEFAULT_EDT_MAX_AGE_US),
+            edt_version(CONFIG_DSHOT_DEFAULT_EDT_VERSION),
+            edt_response_timeout_ms(CONFIG_DSHOT_DEFAULT_EDT_RESPONSE_TIMEOUT_MS),
+            edt_attempts(CONFIG_DSHOT_DEFAULT_EDT_ATTEMPTS) { }
 
     esp_err_t validate_config(const Config& config) {
         if (!detail::is_supported_protocol(config.protocol)) {
@@ -61,10 +66,24 @@ namespace dshot {
         if (!is_valid_task_core(config.task_core)) {
             return ESP_ERR_INVALID_ARG;
         }
-        if (config.signaling == Signaling::Bidirectional) return ESP_ERR_NOT_SUPPORTED;
-        if (config.signaling != Signaling::Regular) return ESP_ERR_INVALID_ARG;
+        if (config.signaling != Signaling::Regular && config.signaling != Signaling::Bidirectional)
+            return ESP_ERR_INVALID_ARG;
+        if (config.motor_poles < 2 || config.motor_poles > 254 || config.motor_poles % 2 != 0)
+            return ESP_ERR_INVALID_ARG;
+        if (!config.erpm_max_age_us || !config.edt_max_age_us ||
+            (config.edt_version != 1 && config.edt_version != 2) ||
+            config.edt_response_timeout_ms < 50 || config.edt_response_timeout_ms > 5000 ||
+            config.edt_attempts == 0 || config.edt_attempts > 10) return ESP_ERR_INVALID_ARG;
         if (!is_valid_framerate(config.frame_hz)) {
             return ESP_ERR_NOT_SUPPORTED;
+        }
+        // Reserve 30 us for turnaround, 40 us for RX idle termination, and 20 us margin.
+        if (config.signaling == Signaling::Bidirectional) {
+            if (config.protocol == Protocol::DShot150) return ESP_ERR_NOT_SUPPORTED;
+            const auto bitrate = static_cast<unsigned>(config.protocol);
+            const auto wire_us = (32'800'000u + bitrate - 1) / bitrate;
+            const auto period_us = (1'000'000u + config.frame_hz / 2) / config.frame_hz;
+            if (period_us < wire_us + 90) return ESP_ERR_NOT_SUPPORTED;
         }
         return ESP_OK;
     }

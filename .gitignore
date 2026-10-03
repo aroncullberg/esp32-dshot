@@ -9,3 +9,5 @@
 .clangd
 .cache/
 **/.cache/
+/README_SLOP.md
+docs/

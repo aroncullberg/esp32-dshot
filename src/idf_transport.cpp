@@ -4,9 +4,10 @@
 #include <cstdlib>
 #include "esp_log.h"
 #include "sdkconfig.h"
-#if CONFIG_DSHOT_TIMING_DIAGNOSTICS
 #include "esp_timer.h"
-#endif
+#include "esp_attr.h"
+#include "hal/gpio_ll.h"
+#include "soc/gpio_struct.h"
 
 namespace dshot::detail {
 namespace {
@@ -16,7 +17,48 @@ constexpr int kTxTimeoutMs = 20;
 void require_disabled(esp_err_t error) {
     if (error != ESP_OK) {
         ESP_LOGE(kTag, "RMT cleanup failed: %s", esp_err_to_name(error));
-        std::abort(); // Unlike ESP_ERROR_CHECK, this is active with assertions disabled.
+        std::abort();
+    }
+}
+
+bool IRAM_ATTR received(rmt_channel_handle_t, const rmt_rx_done_event_data_t* event, void* context) {
+    auto& t = *static_cast<RmtTransport*>(context);
+    BaseType_t wake = pdFALSE;
+    portENTER_CRITICAL_ISR(&t.rx_lock);
+    if (t.accept_rx) {
+        t.rx_count = event->num_symbols;
+        t.accept_rx = false;
+        xSemaphoreGiveFromISR(t.rx_done, &wake);
+    }
+    portEXIT_CRITICAL_ISR(&t.rx_lock);
+    return wake == pdTRUE;
+}
+
+bool IRAM_ATTR transmitted(rmt_channel_handle_t, const rmt_tx_done_event_data_t*, void* context) {
+    auto& t = *static_cast<RmtTransport*>(context);
+    BaseType_t wake = pdFALSE;
+    portENTER_CRITICAL_ISR(&t.rx_lock);
+    // RMT keeps the pin driven high after transmission.
+    gpio_ll_output_disable(&GPIO, t.gpio);
+    if (t.accept_rx) {
+        t.rx_error = rmt_receive(t.rx_channel, t.rx_symbols,
+                                 sizeof(t.rx_symbols), &t.receive_config);
+        if (t.rx_error != ESP_OK) {
+            t.accept_rx = false;
+            xSemaphoreGiveFromISR(t.rx_done, &wake);
+        }
+    }
+    portEXIT_CRITICAL_ISR(&t.rx_lock);
+    return wake == pdTRUE;
+}
+
+void retire_receive(RmtTransport& t) {
+    portENTER_CRITICAL(&t.rx_lock);
+    t.accept_rx = false;
+    portEXIT_CRITICAL(&t.rx_lock);
+    if (t.rx_enabled) {
+        require_disabled(rmt_disable(t.rx_channel));
+        t.rx_enabled = false;
     }
 }
 }
@@ -41,7 +83,9 @@ esp_err_t open_transport(RmtTransport& transport, gpio_num_t gpio, const Config&
     channel_config.mem_block_symbols = 48;
     channel_config.trans_queue_depth = 1;
     channel_config.intr_priority = 0;
-    channel_config.flags.init_level = 0;
+    transport.bidirectional = config.signaling == Signaling::Bidirectional;
+    transport.bitrate = static_cast<unsigned>(config.protocol);
+    channel_config.flags.init_level = transport.bidirectional ? 1 : 0;
     channel_config.flags.invert_out = false;
     channel_config.flags.with_dma = false;
 
@@ -58,6 +102,34 @@ esp_err_t open_transport(RmtTransport& transport, gpio_num_t gpio, const Config&
         return error;
     }
     transport.enabled = true;
+    if (transport.bidirectional) {
+        transport.rx_done = xSemaphoreCreateBinary();
+        if (!transport.rx_done) error = ESP_ERR_NO_MEM;
+        rmt_rx_channel_config_t rx_config{};
+        rx_config.gpio_num = gpio;
+        rx_config.clk_src = RMT_CLK_SRC_XTAL;
+        rx_config.resolution_hz = kRMTResolutionHz;
+        rx_config.mem_block_symbols = 48;
+        if (error == ESP_OK) error = rmt_new_rx_channel(&rx_config, &transport.rx_channel);
+        rmt_rx_event_callbacks_t rx_callbacks{};
+        rx_callbacks.on_recv_done = received;
+        if (error == ESP_OK) error = rmt_rx_register_event_callbacks(transport.rx_channel, &rx_callbacks, &transport);
+        rmt_tx_event_callbacks_t tx_callbacks{};
+        tx_callbacks.on_trans_done = transmitted;
+        if (error == ESP_OK) error = rmt_tx_register_event_callbacks(transport.tx_channel, &tx_callbacks, &transport);
+        if (error == ESP_OK) error = gpio_set_pull_mode(gpio, GPIO_PULLUP_ONLY);
+        if (error == ESP_OK) error = rmt_enable(transport.rx_channel);
+        if (error != ESP_OK) {
+            close_transport_or_abort(transport);
+            return error;
+        }
+        transport.rx_enabled = true;
+        // Use GPIO-controlled output enable to release the pin between packets.
+        // gpio_output_enable() disconnects the RMT route in IDF 6.1.
+        gpio_ll_set_output_enable_ctrl(&GPIO, gpio, false, false);
+        transport.receive_config.signal_range_min_ns = 100;
+        transport.receive_config.signal_range_max_ns = 40000;
+    }
     transport.opened = true;
     transport.faulted = false;
     return ESP_OK;
@@ -66,15 +138,34 @@ esp_err_t open_transport(RmtTransport& transport, gpio_num_t gpio, const Config&
 esp_err_t send_packet(RmtTransport& transport, std::uint16_t packet,
                       std::uint64_t* wait_us) {
     if (wait_us) *wait_us = 0;
+    transport.rx_wait_us = 0;
+    transport.reply = {};
     if (!transport.opened || !transport.enabled || transport.faulted || transport.in_flight) {
         return ESP_ERR_INVALID_STATE;
     }
+    // Bidirectional DShot uses a complemented checksum.
+    if (transport.bidirectional) packet ^= 0xF;
     esp_err_t error = encode_regular_symbols(packet, transport.timing, transport.symbols);
     if (error != ESP_OK) return error;
+    if (transport.bidirectional) {
+        for (auto& symbol : transport.symbols) { symbol.level0 = 0; symbol.level1 = 1; }
+        if (!transport.rx_enabled) {
+            error = rmt_enable(transport.rx_channel);
+            if (error != ESP_OK) { transport.faulted = true; return error; }
+            transport.rx_enabled = true;
+        }
+        (void)xSemaphoreTake(transport.rx_done, 0);
+        portENTER_CRITICAL(&transport.rx_lock);
+        transport.rx_count = 0;
+        transport.rx_error = ESP_OK;
+        transport.accept_rx = true;
+        portEXIT_CRITICAL(&transport.rx_lock);
+        gpio_ll_output_enable(&GPIO, transport.gpio);
+    }
 
     rmt_transmit_config_t transmit_config{};
     transmit_config.loop_count = 0;
-    transmit_config.flags.eot_level = 0;
+    transmit_config.flags.eot_level = transport.bidirectional ? 1 : 0;
     transmit_config.flags.queue_nonblocking = 1;
     error = rmt_transmit(transport.tx_channel, transport.copy_encoder,
                          transport.symbols.data(),
@@ -82,6 +173,10 @@ esp_err_t send_packet(RmtTransport& transport, std::uint16_t packet,
                          &transmit_config);
     if (error != ESP_OK) {
         transport.faulted = true;
+        if (transport.bidirectional) {
+            retire_receive(transport);
+            gpio_ll_output_disable(&GPIO, transport.gpio);
+        }
         return error;
     }
     transport.in_flight = true;
@@ -94,15 +189,38 @@ esp_err_t send_packet(RmtTransport& transport, std::uint16_t packet,
 #endif
     if (error != ESP_OK) {
         transport.faulted = true;
+        if (transport.bidirectional) retire_receive(transport);
         require_disabled(rmt_disable(transport.tx_channel));
         transport.enabled = false;
     }
     transport.in_flight = false;
+    if (transport.bidirectional && error == ESP_OK) {
+        const auto rx_started = esp_timer_get_time();
+        const bool done = xSemaphoreTake(transport.rx_done, pdMS_TO_TICKS(2) + 1) == pdTRUE;
+        portENTER_CRITICAL(&transport.rx_lock);
+        transport.accept_rx = false;
+        const auto rx_error = transport.rx_error;
+        const auto count = transport.rx_count;
+        portEXIT_CRITICAL(&transport.rx_lock);
+        if (!done || rx_error != ESP_OK) {
+            retire_receive(transport);
+            transport.reply.result = done ? ReplyResult::ReceiveError : ReplyResult::NoResponse;
+        } else if (count >= 32) {
+            transport.reply.result = ReplyResult::Overflow;
+        } else {
+            transport.reply = decode_reply(transport.rx_symbols,count,kRMTResolutionHz,transport.bitrate);
+        }
+        transport.rx_wait_us = esp_timer_get_time() - rx_started;
+    }
+    if (transport.bidirectional) gpio_ll_output_disable(&GPIO, transport.gpio);
     return error;
 }
 
 esp_err_t close_transport(RmtTransport& transport) {
     esp_err_t error;
+    portENTER_CRITICAL(&transport.rx_lock);
+    transport.accept_rx = false;
+    portEXIT_CRITICAL(&transport.rx_lock);
     if (transport.enabled) {
         error = rmt_disable(transport.tx_channel);
         if (error != ESP_OK) return error;
@@ -115,12 +233,30 @@ esp_err_t close_transport(RmtTransport& transport) {
         if (error != ESP_OK) return error;
         transport.tx_channel = nullptr;
     }
+    if (transport.rx_enabled) {
+        error = rmt_disable(transport.rx_channel);
+        if (error != ESP_OK) return error;
+        transport.rx_enabled = false;
+    }
+    if (transport.rx_channel) {
+        error = rmt_del_channel(transport.rx_channel);
+        if (error != ESP_OK) return error;
+        transport.rx_channel = nullptr;
+    }
+    if (transport.rx_done) {
+        vSemaphoreDelete(transport.rx_done);
+        transport.rx_done = nullptr;
+    }
     if (transport.copy_encoder) {
         error = rmt_del_encoder(transport.copy_encoder);
         if (error != ESP_OK) return error;
         transport.copy_encoder = nullptr;
     }
     if (transport.gpio != GPIO_NUM_NC) {
+        if (transport.bidirectional) {
+            error = gpio_set_pull_mode(transport.gpio, GPIO_FLOATING);
+            if (error != ESP_OK) return error;
+        }
         error = gpio_set_direction(transport.gpio, GPIO_MODE_DISABLE);
         if (error != ESP_OK) return error;
         transport.gpio = GPIO_NUM_NC;

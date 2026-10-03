@@ -22,14 +22,26 @@ menu "DShot"
         prompt "Default signaling"
         default DSHOT_DEFAULT_REGULAR
         help
-            The first tutorial implements regular DShot. Bidirectional signaling
-            requires output release and a bounded reply window before use.
-            Bidirectional mode currently returns ESP_ERR_NOT_SUPPORTED.
+            Bidirectional mode uses one TX and one RX channel per GPIO and
+            receives eRPM/EDT on the signal wire. Requires compatible ESC firmware.
+            This backend supports bidirectional D300/D600, initially up to 4 kHz.
         config DSHOT_DEFAULT_REGULAR
             bool "Regular (uninverted)"
         config DSHOT_DEFAULT_BIDIRECTIONAL
             bool "Bidirectional (inverted)"
     endchoice
+
+    config DSHOT_DEFAULT_MOTOR_POLES
+        int "Default motor magnetic pole count" if DSHOT_DEFAULT_BIDIRECTIONAL
+        range 2 254
+        default 14
+        help
+            Total rotor magnetic poles, not pole pairs or stator teeth. Use an
+            even value; the component rejects odd counts during validation.
+            Mechanical RPM = electrical RPM / (pole count / 2).
+            Set this to your motor's pole count for accurate mechanical RPM.
+            This supplies Config::motor_poles; C++ can override the default.
+            The default is retained when regular signaling hides this option.
 
     config DSHOT_DEFAULT_FRAME_HZ
         int "Default frames per second"
@@ -64,12 +76,42 @@ menu "DShot"
             allocated; this setting does not move an already allocated interrupt.
 
     config DSHOT_DEFAULT_ERPM_MAX_AGE_US
-        int "Default eRPM maximum age (microseconds; future telemetry)"
+        int "Default eRPM maximum age (microseconds)"
         range 1000 1000000
         default 10000
         help
-            Reserved as the default for the later telemetry implementation.
-            This setting does not enable reception or EDT in the proof of concept.
+            Both moving and stopped samples become stale after this age.
+
+    config DSHOT_DEFAULT_EDT_MAX_AGE_US
+        int "Default EDT field maximum age (microseconds)"
+        range 1000 10000000
+        default 3000000
+
+    config DSHOT_DEFAULT_EDT_VERSION
+        int "Default EDT interpretation (1 = legacy, 2 = stress/events)"
+        range 1 2
+        default 2
+        help
+            Select the field layout implemented by your ESC firmware. Bluejay's
+            enable acknowledgement is 0xE00; it does not identify the layout.
+            The raw acknowledgement and all raw status/debug values are retained.
+
+    config DSHOT_DEFAULT_EDT_RESPONSE_TIMEOUT_MS
+        int "Default EDT acknowledgement timeout (milliseconds)"
+        range 50 5000
+        default 300
+
+    config DSHOT_DEFAULT_EDT_ATTEMPTS
+        int "Default maximum EDT command attempts"
+        range 1 10
+        default 3
+        help
+            Retries only occur while the pending payload remains zero.
+
+    config DSHOT_RMT_RX_IN_IRAM
+        bool
+        default y
+        select RMT_RECV_FUNC_IN_IRAM
 
     config DSHOT_TIMING_DIAGNOSTICS
         bool "Compile detailed timing instrumentation"

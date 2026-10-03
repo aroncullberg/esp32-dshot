@@ -1,49 +1,97 @@
 #!/usr/bin/env python3
-"""Run real POC sources against host fake hardware/RTOS, using configured IDF headers.
-Usage: python3 tests/host/run.py [path/to/idf/build]
-Requires clang++ and an IDF compile_commands.json from a configured C3/S3 bench.
-"""
+"""Run host tests using headers from a configured ESP-IDF bench build."""
 from pathlib import Path
+import argparse
 import json
 import os
 import shlex
+import shutil
 import subprocess
-import sys
 import tempfile
 
-root = Path(__file__).resolve().parents[2]
-build = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else root / "examples/bench/build"
-database = json.loads((build / "compile_commands.json").read_text())
-entry = next(item for item in database if item["file"].endswith("/src/frame_codec.cpp"))
-args = shlex.split(entry["command"])
-# Avoid target libc/FreeRTOS headers; the harness replaces only OS and GPIO operations.
-components = ("esp_common", "esp_driver_rmt", "esp_hal_rmt", "esp_hal_gpio", "soc", "esp_rom", "esp_hw_support")
-includes = [arg for arg in args if arg.startswith("-I") and any(f"/{name}/" in arg for name in components)]
-sources = [root / "src" / name for name in ("config.cpp", "frame_codec.cpp", "idf_transport.cpp", "driver.cpp", "link.cpp", "frame_scheduler.cpp", "command.cpp", "command_sequence.cpp")]
-for detailed in (0, 1):
+ROOT = Path(__file__).resolve().parents[2]
+HOST = ROOT / "tests/host"
+COMPONENTS = {"esp_common", "esp_driver_rmt", "esp_hal_rmt", "esp_hal_gpio", "soc", "esp_rom", "esp_hw_support"}
+UNIT_SOURCES = [
+    HOST / "unit_test.cpp", HOST / "frame_codec_test.cpp",
+    HOST / "command_sequence_test.cpp", HOST / "telemetry_test.cpp",
+    *(ROOT / "src" / name for name in (
+        "config.cpp", "frame_codec.cpp", "command.cpp", "command_sequence.cpp",
+        "telemetry_codec.cpp", "telemetry_state.cpp")),
+]
+INTEGRATION_SOURCES = [
+    HOST / "driver_integration_test.cpp", HOST / "host_support.cpp",
+    *(ROOT / "src" / name for name in (
+        "config.cpp", "frame_codec.cpp", "idf_transport.cpp", "driver.cpp",
+        "link.cpp", "passthrough.cpp", "frame_scheduler.cpp", "command.cpp",
+        "command_sequence.cpp", "telemetry_codec.cpp", "telemetry_state.cpp")),
+]
+BENCH_SOURCES = [
+    HOST / "bench_console_test.cpp",
+    *(ROOT / "src" / name for name in ("config.cpp", "command.cpp", "telemetry_state.cpp")),
+]
+
+
+def idf_includes(build):
+    database_path = build / "compile_commands.json"
+    config_path = build / "config/sdkconfig.h"
+    for path in (database_path, config_path):
+        if not path.is_file():
+            raise ValueError(f"Missing {path}. Configure the bench with ESP-IDF first; see tests/README.md.")
+    database = json.loads(database_path.read_text())
+    entry = next((item for item in database if item["file"].endswith("/src/frame_codec.cpp")), None)
+    if entry is None:
+        raise ValueError(f"No DShot frame codec entry in {database_path}. Reconfigure the bench build.")
+    args = entry["arguments"] if "arguments" in entry else shlex.split(entry["command"])
+    includes = [arg for arg in args if arg.startswith("-I") and COMPONENTS.intersection(Path(arg[2:]).parts)]
+    if not any((Path(arg[2:]) / "esp_err.h").is_file() for arg in includes):
+        raise ValueError("ESP-IDF headers are unavailable at the recorded paths. Reconfigure the bench build.")
+    return includes
+
+
+def run_suite(name, sources, compiler, build, includes, diagnostics=0):
+    print(f"Running {name}", flush=True)
     with tempfile.TemporaryDirectory(prefix="dshot-host-") as temporary:
-        binary = Path(temporary) / "poc_test"
-        # Test both builds regardless of the configuration used to obtain IDF headers.
+        binary = Path(temporary) / name
         (Path(temporary) / "sdkconfig.h").write_text(
-            '#include "' + str(build / "config/sdkconfig.h") + '"\n'
+            f'#include "{build / "config/sdkconfig.h"}"\n'
             '#undef CONFIG_DSHOT_TIMING_DIAGNOSTICS\n'
             '#undef CONFIG_FREERTOS_HZ\n#define CONFIG_FREERTOS_HZ 100\n'
-            f'#define CONFIG_DSHOT_TIMING_DIAGNOSTICS {detailed}\n')
-        command = [os.environ.get("CXX", "clang++"), "-std=c++17", "-pthread", "-Wall", "-Wextra", "-Werror",
-                   "-Wno-extern-c-compat", "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
-                   "-I" + temporary, "-I" + str(root / "tests/host/fakes"), "-I" + str(build / "config"),
-                   "-I" + str(root / "include"), "-I" + str(root / "src"), *includes,
-                   str(root / "tests/host/poc_test.cpp"), str(root / "tests/host/learning_checks.cpp"), str(root / "tests/host/command_test.cpp"), *(str(source) for source in sources), "-o", str(binary)]
+            f'#define CONFIG_DSHOT_TIMING_DIAGNOSTICS {diagnostics}\n')
+        command = [
+            *compiler, "-std=c++17", "-pthread", "-Wall", "-Wextra", "-Werror",
+            "-Wno-extern-c-compat", "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
+            "-I" + temporary, "-I" + str(HOST / "fakes"), "-I" + str(build / "config"),
+            "-I" + str(ROOT / "include"), "-I" + str(ROOT / "src"), *includes,
+            *(str(source) for source in sources), "-o", str(binary),
+        ]
         subprocess.run(command, check=True)
         subprocess.run([str(binary)], check=True, timeout=20)
 
-# Exercise the actual bench command parser/worker separately from the driver mocks above.
-with tempfile.TemporaryDirectory(prefix="dshot-bench-test-") as temporary:
-    binary = Path(temporary) / "bench_test"
-    command = [os.environ.get("CXX", "clang++"), "-std=c++17", "-pthread", "-Wall", "-Wextra", "-Werror",
-               "-Wno-extern-c-compat", "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
-               "-I" + str(root / "tests/host/fakes"), "-I" + str(build / "config"),
-               "-I" + str(root / "include"), "-I" + str(root / "src"), *includes,
-               str(root / "tests/host/bench_test.cpp"), str(root / "src/config.cpp"), str(root / "src/command.cpp"), "-o", str(binary)]
-    subprocess.run(command, check=True)
-    subprocess.run([str(binary)], check=True, timeout=20)
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("build", nargs="?", type=Path, default=ROOT / "examples/bench/build",
+                        help="configured ESP-IDF bench build directory")
+    args = parser.parse_args()
+    try:
+        build = args.build.resolve()
+        includes = idf_includes(build)
+        compiler = shlex.split(os.environ.get("CXX", "clang++"))
+        if not compiler or shutil.which(compiler[0]) is None:
+            raise ValueError("Host C++ compiler not found. Install clang++ or set CXX to a host compiler with ASan/UBSan support.")
+        run_suite("unit_test", UNIT_SOURCES, compiler, build, includes)
+        for diagnostics in (0, 1):
+            run_suite(f"driver_integration_test_{diagnostics}", INTEGRATION_SOURCES,
+                      compiler, build, includes, diagnostics)
+        run_suite("bench_console_test", BENCH_SOURCES, compiler, build, includes)
+    except (OSError, ValueError, KeyError) as error:
+        parser.exit(1, f"error: {error}\n")
+    except subprocess.CalledProcessError as error:
+        parser.exit(1, f"error: {error.cmd[0]} failed (exit {error.returncode}).\n")
+    except subprocess.TimeoutExpired as error:
+        parser.exit(1, f"error: {error.cmd[0]} exceeded the {error.timeout}-second timeout.\n")
+
+
+if __name__ == "__main__":
+    main()

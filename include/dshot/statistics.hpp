@@ -5,7 +5,7 @@
 #include <cstdint>
 
 namespace dshot {
-// Elapsed microseconds, including preemption. An empty sample has count == 0.
+// Elapsed microseconds, including preemption.
 struct TimingStatistics {
     std::uint64_t count = 0;
     std::uint64_t total_us = 0;
@@ -20,12 +20,12 @@ struct LinkStatistics {
     std::uint64_t command_pauses = 0;
     TimingStatistics outside_tx_wait;
     TimingStatistics tx_wait;
-    // Intervals between successful completion observations, not GPIO edges.
+    TimingStatistics rx_wait;
+    // Time between transmission completions as observed by the worker.
     TimingStatistics completion_interval;
 };
 
 struct DriverStatistics {
-    // Maximum on the supported targets; link_count identifies populated entries.
     static constexpr std::size_t max_links = 4;
     bool running = false;
     bool detailed_timing = false;

@@ -1,4 +1,3 @@
-// Execute the real console parser and worker with scripted commands and time.
 #include <cassert>
 #include <vector>
 #include <string>
@@ -43,6 +42,11 @@ DriverStatistics Driver::statistics() const {
 }
 Link::Link(Driver& driver, gpio_num_t pin) : driver_(driver), pin_(pin) {}
 Link::~Link() {}
+Telemetry Link::telemetry() const { return {}; }
+ReceiveCapture Link::receive_capture() const { return {}; }
+esp_err_t Link::request_edt(bool enabled) {
+    return send_command(enabled ? dshot::Command::ExtendedTelemetryEnable : dshot::Command::ExtendedTelemetryDisable);
+}
 esp_err_t Link::begin() { ++begins; payload = 0; return ESP_OK; }
 void Link::end() { ++closes; }
 esp_err_t Link::set(std::uint16_t value, bool) {
@@ -73,7 +77,6 @@ BaseType_t xQueueSend(QueueHandle_t, const void* command, TickType_t) {
     return pdTRUE;
 }
 BaseType_t xQueueReceive(QueueHandle_t, void* command, TickType_t) {
-    // The previous event must have produced these outputs before the next receive.
     if (next_event != 0) {
         const auto& previous = events[next_event - 1];
         assert(stream == previous.expected_stream);
@@ -125,31 +128,38 @@ int main() {
     assert(parse(esc_command,{"command","20"}) == 0 && parsed.back().payload == 20);
     assert(parse(esc_command,{"command","15"}) != 0);
     assert(parse(esc_command,{"command","status"}) == 0 && parsed.back().action == Action::CommandStatus);
+    assert(parse(telemetry_command,{"telemetry"}) == 0 && parsed.back().action == Action::Telemetry);
+    assert(parse(telemetry_command,{"telemetry","raw"}) == 0 && parsed.back().action == Action::TelemetryRaw);
+    assert(parse(telemetry_command,{"telemetry","invalid"}) == 1);
+    assert(parse(edt_command,{"edt","on"}) == 0 && parsed.back().action == Action::Edt && parsed.back().payload == 1);
+    assert(parse(edt_command,{"edt","off"}) == 0 && parsed.back().payload == 0);
+    assert(parse(edt_command,{"edt","status"}) == 0 && parsed.back().action == Action::Telemetry);
+    assert(parse(edt_command,{"edt","bad"}) != 0);
 
     constexpr std::int64_t hold = static_cast<std::int64_t>(CONFIG_DSHOT_BENCH_ARM_HOLD_MS) * 1000;
     events = {
         {0, true, {Action::Run,200}, false, 0},
         {1, true, {Action::Arm}, true, 0},
         {2, true, {Action::Run,200}, true, 0},
-        {3, true, {Action::EscCommand,1}, true, 0}, // Still arming.
+        {3, true, {Action::EscCommand,1}, true, 0},
         {hold+2, false, {}, true, 200},
-        {hold+100000000, false, {}, true, 200}, // No timeout, even after 100 seconds.
+        {hold+100000000, false, {}, true, 200}, // No timeout after 100 seconds.
         {hold+100000000, true, {Action::Stats}, true, 200},
         {hold+100000000, true, {Action::Stats}, true, 200}, // Zero-length interval.
         {hold+100000001, true, {Action::Run,300}, true, 300},
         {hold+100000002, true, {Action::Stop}, true, 0},
-        {hold+100000003, false, {}, true, 0}, // Stop preserves the frame stream.
+        {hold+100000003, false, {}, true, 0},
         {hold+100000004, true, {Action::Arm}, true, 0},
         {hold+100000005, true, {Action::Run,400}, true, 0},
         {hold+100000006, true, {Action::Stop}, true, 0}, // Cancels queued run.
         {2*hold+100000010, false, {}, true, 0},
         {2*hold+100000011, true, {Action::EscCommand,1}, true, 0},
-        {2*hold+100000012, true, {Action::Run,200}, true, 0}, // Busy preserves zero and stream.
+        {2*hold+100000012, true, {Action::Run,200}, true, 0}, // Reject a run request while an ESC command is pending.
         {2*hold+100000013, true, {Action::EscCommand,20}, true, 0},
         {2*hold+100000014, true, {Action::CommandStatus}, true, 0},
-        {2*hold+100000015, true, {Action::Stop}, true, 0}, // Cancel command.
+        {2*hold+100000015, true, {Action::Stop}, true, 0},
         {2*hold+100000016, true, {Action::Run,200}, true, 200},
-        {2*hold+100000017, true, {Action::EscCommand,20}, true, 200}, // Stop first.
+        {2*hold+100000017, true, {Action::EscCommand,20}, true, 200}, // Reject an ESC command while the motor is running.
         {2*hold+100000018, true, {Action::Stop}, true, 0},
         {2*hold+100000019, true, {Action::EscCommand,8}, true, 0},
     };
