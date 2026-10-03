@@ -1,52 +1,37 @@
 # DShot bench
 
-Build from this directory with ESP-IDF 6.1:
+A serial console example for running a motor, sending ESC commands, and reading telemetry.
+
+## Build and run
+
+With ESP-IDF 6.1 activated, run from this directory:
 
 ```sh
+idf.py set-target esp32c3
 idf.py menuconfig
 idf.py build
 idf.py -p YOUR_SERIAL_PORT flash monitor
 ```
 
-Set the signal GPIO in `DShot bench`, and bitrate/signaling/frame rate in
-`Component config → DShot`. Regular D150/D300/D600 and bidirectional D300/D600
-are supported. For a new configuration, select `esp32c3` or `esp32s3` with
-`idf.py set-target` first.
+Use `esp32s3` instead for an S3 board. Skip `set-target` if the project is already configured for your chip.
 
-- `arm`: start zero frames, wait the configured interval, then keep zero frames running.
-- `run <0..2047>`: hold the raw value until another run or stop.
-- `stop`: return to zero frames without stopping transmission.
-- `stats`: show per-GPIO completed frames/s, frame/error totals, and missed slots.
-- `beep [1..5]`: issue one beep, defaulting to tone 1.
-- `direction <normal|reversed|1|2>`: issue a direction command.
+In `menuconfig`, set the signal GPIO under `DShot bench` and the bitrate, signaling mode, and frame rate under `Component config → DShot`. For motor RPM readings, set the motor's magnetic pole count too.
+
+## Console commands
+
+- `arm`: send zero frames through the arming interval, then keep sending.
+- `run <0..2047>`: hold a raw DShot value until changed; there is no automatic stop.
+- `stop`: return to zero frames and cancel any command sequence.
+- `beep [1..5]`: play a tone.
+- `direction <normal|reversed|1|2>`: set motor direction.
 - `save`: save ESC settings.
-- `command <name|id|list|status>`: list/send other named commands or inspect progress.
-- `telemetry`: show eRPM, motor RPM, received EDT fields, their ages, and RX counters.
-- `telemetry raw`: show the latest nonempty RX capture, decode result, age and
-  pulse durations in clock ticks. Useful when malformed/GCR/CRC counters grow.
-- `edt <on|off|status>`: request EDT enable/disable or inspect telemetry.
+- `command <name|id|list|status>`: send other commands, list them, or check progress.
+- `telemetry`: show speed and Extended DShot Telemetry (EDT).
+- `telemetry raw`: show the latest captured reply for debugging.
+- `edt <on|off|status>`: enable, disable, or check EDT.
+- `stats`: show frame rates and error counters.
 
-Set **Component config → DShot → Default motor magnetic pole count** to your
-motor's total magnetic poles (default 14). This option appears with bidirectional
-signaling; C++ can override it through `Config::motor_poles`.
+Start with `arm` and wait for arming to finish before using `run`. Use `stop` before sending ESC commands.
 
-For the first receive test select **Bidirectional (inverted)**, D600, and 1000 Hz.
-Restart the ESC after changing signaling. `arm`, wait for arming, then `telemetry`
-should show a fresh stopped sample. Try `run 100`, `telemetry`, then `stop` and
-`edt on`. Read `telemetry` again after about a second. See
-[telemetry setup and troubleshooting](../../docs/TELEMETRY.md).
+Telemetry needs bidirectional signaling. Restart the ESC after changing signaling mode.
 
-After arming, use `stop` before sending an ESC command. A command leaves the link
-sending zero; use `run` again after completion. `stop` cancels remaining repetitions.
-See [command usage and API](../../docs/COMMANDS.md), including the distinction
-between AM32's direction 1/2 and normal/reversed commands.
-
-The first `stats` rate covers the session so far; subsequent readings use the
-interval since the previous reading. It leaves the stream and payload unchanged.
-Enable `DSHOT_TIMING_DIAGNOSTICS` under `Component config → DShot` for detailed
-elapsed timings. See [statistics and baseline measurement](../../docs/STATISTICS.md).
-
-To increase cadence, change **Component config → DShot → Default frames per
-second** to 2000 or 4000, rebuild, and flash. GPTimer supplies the wake-up period;
-the FreeRTOS tick rate can remain unchanged. `stats` also prints the configured
-timer period (500 us at 2 kHz, 250 us at 4 kHz). All links are still sent sequentially.
