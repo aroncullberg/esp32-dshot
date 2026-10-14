@@ -1,4 +1,5 @@
 #include <cerrno>
+#include <array>
 #include <cstdint>
 #include <cinttypes>
 #include <cstdio>
@@ -17,7 +18,17 @@
 #include "freertos/task.h"
 
 namespace {
-enum class Action { Arm, Run, Stop, Stats, EscCommand, CommandStatus, Telemetry, TelemetryRaw, Edt };
+#if DSHOT_BENCH_FOUR_MOTORS
+constexpr std::array<gpio_num_t, 4> motor_pins{
+    static_cast<gpio_num_t>(CONFIG_DSHOT_BENCH_GPIO),
+    static_cast<gpio_num_t>(CONFIG_DSHOT_BENCH_GPIO_2),
+    static_cast<gpio_num_t>(CONFIG_DSHOT_BENCH_GPIO_3),
+    static_cast<gpio_num_t>(CONFIG_DSHOT_BENCH_GPIO_4)};
+#else
+constexpr std::array<gpio_num_t, 1> motor_pins{static_cast<gpio_num_t>(CONFIG_DSHOT_BENCH_GPIO)};
+#endif
+constexpr unsigned all_motors = (1u << motor_pins.size()) - 1;
+enum class Action { Arm, Run, Stop, Stats, EscCommand, CommandStatus, Telemetry, TelemetryRaw, Edt, Motor };
 struct Command {
     Action action;
     std::uint16_t payload = 0;
@@ -45,6 +56,18 @@ int stats_command(int argc, char**) {
     return enqueue({Action::Stats});
 }
 
+#if DSHOT_BENCH_FOUR_MOTORS
+int motor_command(int argc, char** argv) {
+    if (argc == 2) {
+        if (std::strcmp(argv[1], "all") == 0) return enqueue({Action::Motor, all_motors});
+        if (argv[1][0] >= '1' && argv[1][0] <= '4' && argv[1][1] == '\0')
+            return enqueue({Action::Motor, static_cast<std::uint16_t>(1u << (argv[1][0] - '1'))});
+    }
+    std::puts("motor <1..4|all>");
+    return 1;
+}
+#endif
+
 int telemetry_command(int argc, char** argv) {
     if (argc == 1) return enqueue({Action::Telemetry});
     if (argc == 2 && std::strcmp(argv[1],"raw") == 0) return enqueue({Action::TelemetryRaw});
@@ -66,6 +89,8 @@ void print_receive_stats(const dshot::Telemetry& data) {
     std::printf("RX: replies %" PRIu64 " | no response %" PRIu64 " | malformed %" PRIu64
                 " | GCR %" PRIu64 " | CRC %" PRIu64 " | overflow %" PRIu64 " | errors %" PRIu64 "\n",
                 c.replies,c.no_response,c.malformed,c.gcr_errors,c.checksum_errors,c.overflows,c.receive_errors);
+    std::printf("  no response breakdown: timeouts %" PRIu64 " | empty/idle captures %" PRIu64 "\n",
+                c.rx_timeouts, c.empty_captures);
 }
 void print_capture(const dshot::ReceiveCapture& capture) {
     if (!capture.pulse_count) { std::puts("RX capture: no data"); return; }
@@ -240,26 +265,63 @@ void register_command(const char* name, const char* help, esp_console_cmd_func_t
 void bench_worker(void*) {
     dshot::Config config;
     dshot::Driver driver(config);
-    dshot::Link link(driver, static_cast<gpio_num_t>(CONFIG_DSHOT_BENCH_GPIO));
+#if DSHOT_BENCH_FOUR_MOTORS
+    std::array<dshot::Link, 4> links{{{driver, motor_pins[0]}, {driver, motor_pins[1]},
+                                   {driver, motor_pins[2]}, {driver, motor_pins[3]}}};
+#else
+    std::array<dshot::Link, 1> links{{{driver, motor_pins[0]}}};
+#endif
     bool opened = false;
+    unsigned opened_motors = 0;
+    unsigned selected_motors = all_motors;
     int64_t arm_until_us = 0;
-    std::uint16_t requested_payload = 0;
+    std::array<std::uint16_t, motor_pins.size()> requested_payloads{};
     dshot::DriverStatistics previous_statistics;
 
+    auto selected = [&](std::size_t i) { return (selected_motors & (1u << i)) != 0; };
+    auto label = [&](std::size_t i) {
+        if (motor_pins.size() > 1) std::printf("Motor %u (GPIO %d):\n", static_cast<unsigned>(i + 1), motor_pins[i]);
+    };
     auto close_on_error = [&]() {
         driver.stop();
-        link.end();
+        for (auto& link : links) link.end();
         opened = false;
+        opened_motors = 0;
         arm_until_us = 0;
-        requested_payload = 0;
+        requested_payloads.fill(0);
     };
-    auto set_payload = [&](std::uint16_t payload) {
-        const auto error = link.set(payload);
-        if (error == ESP_OK) return true;
-        if (error == ESP_ERR_INVALID_STATE) { std::puts("command busy"); return false; }
-        std::printf("set: %s\n", esp_err_to_name(error));
-        close_on_error();
-        return false;
+    auto set_payload = [&](std::uint16_t payload, unsigned motors) {
+        // Check every target before changing any motor's throttle.
+        if (payload != 0) {
+            for (std::size_t i = 0; i < links.size(); ++i) {
+                if (!(motors & (1u << i))) continue;
+                const auto state = links[i].command_status().state;
+                if (state == dshot::CommandState::Pending || state == dshot::CommandState::Preparing ||
+                    state == dshot::CommandState::Transmitting || state == dshot::CommandState::Cooldown) {
+                    std::puts("command busy");
+                    return false;
+                }
+            }
+        }
+        for (std::size_t i = 0; i < links.size(); ++i) {
+            if (!(motors & (1u << i))) continue;
+            const auto error = links[i].set(payload);
+            if (error == ESP_OK) continue;
+            std::printf("set motor %u: %s\n", static_cast<unsigned>(i + 1), esp_err_to_name(error));
+            // Cancel any partial group update before returning an error.
+            for (std::size_t j = 0; j < links.size(); ++j)
+                if (opened_motors & (1u << j)) (void)links[j].set(0);
+            close_on_error();
+            return false;
+        }
+        return true;
+    };
+    auto targets_open = [&]() {
+        if (!opened || (selected_motors & opened_motors) != selected_motors) {
+            std::puts("arm first");
+            return false;
+        }
+        return true;
     };
 
     for (;;) {
@@ -271,19 +333,31 @@ void bench_worker(void*) {
         }
         if (opened && arm_until_us != 0 && esp_timer_get_time() >= arm_until_us) {
             arm_until_us = 0;
-            if (set_payload(requested_payload)) {
-                std::puts("armed");
-                if (requested_payload != 0) std::printf("run %u\n", requested_payload);
+            for (std::size_t i = 0; i < links.size(); ++i) {
+                if (!(opened_motors & (1u << i))) continue;
+                if (!set_payload(requested_payloads[i], 1u << i)) break;
+                if (requested_payloads[i] != 0) {
+                    label(i);
+                    std::printf("run %u\n", requested_payloads[i]);
+                }
             }
+            if (opened) std::puts("armed");
         }
         if (!received) continue;
 
         switch (command.action) {
         case Action::Arm: {
+            if (opened && opened_motors != selected_motors) close_on_error();
             if (!opened) {
-                auto error = link.begin();
+                esp_err_t error = ESP_OK;
+                for (std::size_t i = 0; i < links.size(); ++i) {
+                    if (!selected(i)) continue;
+                    error = links[i].begin();
+                    if (error != ESP_OK) break;
+                }
                 if (error == ESP_OK) {
                     opened = true;
+                    opened_motors = selected_motors;
                     previous_statistics = {};
                     error = driver.start();
                 }
@@ -293,8 +367,8 @@ void bench_worker(void*) {
                     break;
                 }
             }
-            requested_payload = 0;
-            if (set_payload(0)) {
+            requested_payloads.fill(0);
+            if (set_payload(0, opened_motors)) {
                 arm_until_us = esp_timer_get_time() +
                     static_cast<int64_t>(CONFIG_DSHOT_BENCH_ARM_HOLD_MS) * 1000;
                 std::puts("arming");
@@ -302,58 +376,94 @@ void bench_worker(void*) {
             break;
         }
         case Action::Run:
-            if (!opened) {
-                std::puts("arm first");
-                break;
-            }
+            if (!targets_open()) break;
             if (arm_until_us != 0) {
-                requested_payload = command.payload;
+                for (std::size_t i = 0; i < links.size(); ++i)
+                    if (selected(i)) requested_payloads[i] = command.payload;
                 std::printf("queued %u until armed\n", command.payload);
-            } else if (set_payload(command.payload)) {
-                requested_payload = command.payload;
+            } else if (set_payload(command.payload, selected_motors)) {
+                for (std::size_t i = 0; i < links.size(); ++i)
+                    if (selected(i)) requested_payloads[i] = command.payload;
                 std::printf("run %u\n", command.payload);
             }
             break;
         case Action::Stop:
-            requested_payload = 0;
-            if (!opened || set_payload(0)) std::puts("stopped");
+            requested_payloads.fill(0);
+            if (!opened || set_payload(0, opened_motors)) std::puts("stopped");
             break;
         case Action::Stats: {
             const auto snapshot = driver.statistics();
             print_statistics(snapshot, previous_statistics);
-            print_receive_stats(link.telemetry());
+            for (std::size_t i = 0; i < links.size(); ++i) {
+                if (!(opened_motors & (1u << i))) continue;
+                label(i);
+                print_receive_stats(links[i].telemetry());
+            }
             previous_statistics = snapshot;
             break;
         }
         case Action::EscCommand: {
-            if (!opened) { std::puts("arm first"); break; }
+            if (!targets_open()) break;
             if (arm_until_us != 0) { std::puts("wait until armed"); break; }
-            if (requested_payload != 0) { std::puts("stop first"); break; }
+            bool running = false;
+            for (std::size_t i = 0; i < links.size(); ++i)
+                if (selected(i) && requested_payloads[i] != 0) running = true;
+            if (running) { std::puts("stop first"); break; }
             const auto id = static_cast<dshot::Command>(command.payload);
-            const auto error = link.send_command(id);
-            if (error == ESP_OK) std::printf("%s queued\n", dshot::command_info(id)->name);
-            else if (error == ESP_ERR_INVALID_STATE) std::puts("command busy");
-            else std::printf("command: %s\n", esp_err_to_name(error));
+            for (std::size_t i = 0; i < links.size(); ++i) {
+                if (!selected(i)) continue;
+                label(i);
+                const auto error = links[i].send_command(id);
+                if (error == ESP_OK) std::printf("%s queued\n", dshot::command_info(id)->name);
+                else if (error == ESP_ERR_INVALID_STATE) std::puts("command busy");
+                else std::printf("command: %s\n", esp_err_to_name(error));
+            }
             break;
         }
         case Action::CommandStatus:
-            print_command_status(link.command_status());
+            for (std::size_t i = 0; i < links.size(); ++i) {
+                if (!selected(i)) continue;
+                label(i);
+                print_command_status(links[i].command_status());
+            }
             break;
         case Action::Telemetry:
-            print_telemetry(link.telemetry());
+            for (std::size_t i = 0; i < links.size(); ++i) {
+                if (!selected(i)) continue;
+                label(i);
+                print_telemetry(links[i].telemetry());
+            }
             break;
         case Action::TelemetryRaw:
-            print_capture(link.receive_capture());
+            for (std::size_t i = 0; i < links.size(); ++i) {
+                if (!selected(i)) continue;
+                label(i);
+                print_capture(links[i].receive_capture());
+            }
             break;
         case Action::Edt: {
-            if (!opened) { std::puts("arm first"); break; }
+            if (!targets_open()) break;
             if (arm_until_us) { std::puts("wait until armed"); break; }
-            if (requested_payload) { std::puts("stop first"); break; }
-            const auto error = link.request_edt(command.payload != 0);
-            if (error == ESP_OK) std::puts(command.payload ? "EDT enable queued" : "EDT disable queued");
-            else std::printf("EDT: %s\n",esp_err_to_name(error));
+            bool running = false;
+            for (std::size_t i = 0; i < links.size(); ++i)
+                if (selected(i) && requested_payloads[i] != 0) running = true;
+            if (running) { std::puts("stop first"); break; }
+            for (std::size_t i = 0; i < links.size(); ++i) {
+                if (!selected(i)) continue;
+                label(i);
+                const auto error = links[i].request_edt(command.payload != 0);
+                if (error == ESP_OK) std::puts(command.payload ? "EDT enable queued" : "EDT disable queued");
+                else std::printf("EDT: %s\n",esp_err_to_name(error));
+            }
             break;
         }
+        case Action::Motor:
+            selected_motors = command.payload;
+            std::printf("selected motors:");
+            for (std::size_t i = 0; i < links.size(); ++i)
+                if (selected(i)) std::printf(" %u", static_cast<unsigned>(i + 1));
+            std::putchar('\n');
+            break;
         }
     }
 }
@@ -382,9 +492,19 @@ extern "C" void app_main() {
     register_command("command", "command <name|id|list|status>", esc_command);
     register_command("telemetry", "Show eRPM/EDT and counters; telemetry raw shows captured pulses", telemetry_command);
     register_command("edt", "edt <on|off|status>", edt_command);
-    std::printf("GPIO %d | DShot%d | %d Hz\n", CONFIG_DSHOT_BENCH_GPIO,
-                CONFIG_DSHOT_DEFAULT_BITRATE / 1000, CONFIG_DSHOT_DEFAULT_FRAME_HZ);
+#if DSHOT_BENCH_FOUR_MOTORS
+    register_command("motor", "motor <1..4|all>: select targets; arm opens only the selection; stop always stops all", motor_command);
+#endif
+    for (std::size_t i = 0; i < motor_pins.size(); ++i)
+        std::printf("Motor %u: GPIO %d\n", static_cast<unsigned>(i + 1), motor_pins[i]);
+    std::printf("DShot%d | target %d Hz per motor | FreeRTOS %d Hz | RX timeout %u ticks\n",
+                CONFIG_DSHOT_DEFAULT_BITRATE / 1000, CONFIG_DSHOT_DEFAULT_FRAME_HZ,
+                CONFIG_FREERTOS_HZ, static_cast<unsigned>(pdMS_TO_TICKS(2) + 1));
+    std::printf("Startup low hold: %u ms per output\n", dshot::Config{}.startup_low_ms);
+    if (motor_pins.size() > 1) std::puts("All motors selected. motor 1..4 selects one; motor all selects all.");
     std::puts(dshot::Config{}.signaling == dshot::Signaling::Bidirectional ?
               "Bidirectional (inverted)" : "Regular (uninverted)");
+    if (dshot::Config{}.signaling == dshot::Signaling::Bidirectional)
+        std::puts("RX starts before TX; outgoing echo removed");
     ESP_ERROR_CHECK(esp_console_start_repl(repl));
 }

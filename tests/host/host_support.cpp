@@ -53,8 +53,14 @@ const auto clock_start = std::chrono::steady_clock::now();
 std::atomic<std::int64_t> command_clock_us{-1};
 std::array<rmt_channel_handle_t,49> receivers{};
 bool silence = false, bad_reply_crc = false, rx_overflow = false, fail_rx_new = false;
+bool empty_reply = false;
+bool stall_receive = false;
 bool fail_receive = false, fail_rx_register = false, fail_tx_register = false, fail_rx_enable = false;
 std::uint16_t reply_payload = 0xFFF;
+bool fail_startup_level = false, fail_startup_output = false;
+unsigned startup_pulses = 0;
+TickType_t startup_delay_ticks = 0;
+int startup_gpio = -1;
 
 
 void join_tasks() {
@@ -71,6 +77,7 @@ Config config() {
     result.signaling = Signaling::Regular;
     result.frame_hz = 1000;
     result.task_core = -1;
+    result.startup_low_ms = 0;
     return result;
 }
 }
@@ -111,6 +118,11 @@ BaseType_t xTaskCreatePinnedToCore(void (*entry)(void*), const char*, unsigned, 
 void vTaskDelete(TaskHandle_t) {
     std::lock_guard lock(current_task->mutex);
     current_task->deleted = true;
+}
+void vTaskDelay(TickType_t ticks) {
+    assert(startup_gpio >= 0 && pad_driven(startup_gpio) && !GPIO.rmt_routed[startup_gpio]);
+    ++startup_pulses;
+    startup_delay_ticks = ticks;
 }
 TaskHandle_t xTaskGetCurrentTaskHandle() { return current_task; }
 BaseType_t xTaskNotifyGive(TaskHandle_t handle) {
@@ -230,9 +242,24 @@ const char* esp_err_to_name(esp_err_t error) {
     return error == ESP_OK ? "ESP_OK" : error == ESP_ERR_TIMEOUT ? "ESP_ERR_TIMEOUT" : "injected/error";
 }
 esp_err_t gpio_set_direction(gpio_num_t gpio, gpio_mode_t mode) {
-    assert(GPIO_IS_VALID_OUTPUT_GPIO(gpio) && mode == GPIO_MODE_DISABLE);
+    assert(GPIO_IS_VALID_OUTPUT_GPIO(gpio));
+    if (mode == GPIO_MODE_OUTPUT_OD) {
+        assert(startup_gpio == gpio); // Low latch must be set before enabling output.
+        if (fail_startup_output) { fail_startup_output = false; return ESP_FAIL; }
+        GPIO.rmt_routed[gpio] = false;
+        GPIO.peripheral_oe[gpio] = false;
+        GPIO.enabled[gpio] = true;
+        return ESP_OK;
+    }
+    assert(mode == GPIO_MODE_DISABLE);
     GPIO.enabled[gpio] = false;
     GPIO.peripheral_oe[gpio] = false;
+    return ESP_OK;
+}
+esp_err_t gpio_set_level(gpio_num_t gpio, unsigned level) {
+    assert(GPIO_IS_VALID_OUTPUT_GPIO(gpio) && level == 0);
+    if (fail_startup_level) { fail_startup_level = false; return ESP_FAIL; }
+    startup_gpio = gpio;
     return ESP_OK;
 }
 esp_err_t gpio_set_pull_mode(gpio_num_t, gpio_pull_mode_t) { return ESP_OK; }
@@ -256,7 +283,7 @@ esp_err_t rmt_tx_register_event_callbacks(rmt_channel_handle_t channel, const rm
 esp_err_t rmt_receive(rmt_channel_handle_t channel, void* buffer, size_t bytes, const rmt_receive_config_t* config) {
     assert(channel->rx && channel->enabled && !channel->active);
     assert(bytes == 32*sizeof(rmt_symbol_word_t) && config->signal_range_max_ns == 40000);
-    assert(!pad_driven(channel->gpio)); // Release must precede reception.
+    assert(pad_driven(channel->gpio)); // RX is armed before TX, while idle-high is driven.
     assert(GPIO.rmt_routed[channel->gpio]);
     if (fail_receive) { fail_receive=false; return ESP_FAIL; }
     channel->active=true;
@@ -344,6 +371,8 @@ esp_err_t rmt_tx_wait_all_done(rmt_channel_handle_t channel, int timeout_ms) {
         packet = (packet << 1) | (symbol.duration0 == 50);
     }
     wire_packets.push_back(packet);
+    SymbolFrame frame{};
+    std::copy_n(channel->buffer, frame.size(), frame.begin());
     channel->active = false;
     channel->buffer = nullptr;
     wire_changed.notify_all();
@@ -352,8 +381,11 @@ esp_err_t rmt_tx_wait_all_done(rmt_channel_handle_t channel, int timeout_ms) {
         rmt_tx_done_event_data_t event{17};
         channel->tx_callback(channel,&event,channel->context);
         auto* rx = receivers[channel->gpio];
-        if (rx && rx->active && !silence) {
-            const auto capture=esc_reply(reply_payload,600000,bad_reply_crc);
+        assert(!pad_driven(channel->gpio)); // TX-done must release the pin for the ESC.
+        if (rx && rx->active && !stall_receive) {
+            const auto capture=empty_reply ? std::vector<rmt_symbol_word_t>{} :
+                exchange_capture(frame, silence ? std::vector<rmt_symbol_word_t>{} :
+                    esc_reply(reply_payload,600000,bad_reply_crc));
             std::copy(capture.begin(),capture.end(),rx->rx_buffer);
             rx->active=false;
             rmt_rx_done_event_data_t received{};

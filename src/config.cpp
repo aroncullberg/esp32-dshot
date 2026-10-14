@@ -48,7 +48,8 @@ namespace dshot {
             edt_max_age_us(CONFIG_DSHOT_DEFAULT_EDT_MAX_AGE_US),
             edt_version(CONFIG_DSHOT_DEFAULT_EDT_VERSION),
             edt_response_timeout_ms(CONFIG_DSHOT_DEFAULT_EDT_RESPONSE_TIMEOUT_MS),
-            edt_attempts(CONFIG_DSHOT_DEFAULT_EDT_ATTEMPTS) { }
+            edt_attempts(CONFIG_DSHOT_DEFAULT_EDT_ATTEMPTS),
+            startup_low_ms(CONFIG_DSHOT_DEFAULT_STARTUP_LOW_MS) { }
 
     esp_err_t validate_config(const Config& config) {
         if (!detail::is_supported_protocol(config.protocol)) {
@@ -68,6 +69,7 @@ namespace dshot {
         }
         if (config.signaling != Signaling::Regular && config.signaling != Signaling::Bidirectional)
             return ESP_ERR_INVALID_ARG;
+        if (config.startup_low_ms > 1000) return ESP_ERR_INVALID_ARG;
         if (config.motor_poles < 2 || config.motor_poles > 254 || config.motor_poles % 2 != 0)
             return ESP_ERR_INVALID_ARG;
         if (!config.erpm_max_age_us || !config.edt_max_age_us ||

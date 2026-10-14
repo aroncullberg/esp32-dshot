@@ -18,6 +18,9 @@ using namespace host_test;
 void test_config_and_transport() {
     auto c = config();
     assert(validate_config(c) == ESP_OK);
+    c.startup_low_ms = 1001;
+    assert(validate_config(c) == ESP_ERR_INVALID_ARG);
+    c.startup_low_ms = 0;
     assert(c.motor_poles == CONFIG_DSHOT_DEFAULT_MOTOR_POLES);
     for (const auto poles : {0u,1u,3u,13u,255u,256u}) {
         c.motor_poles = poles;
@@ -56,6 +59,31 @@ void test_config_and_transport() {
         assert(close_transport(transport) == ESP_OK);
     }
     clean();
+}
+
+void test_startup_low_hold() {
+    auto c = config();
+    c.signaling = Signaling::Bidirectional;
+    c.startup_low_ms = 300;
+    const auto before = startup_pulses;
+    RmtTransport t;
+    assert(open_transport(t, GPIO_NUM_2, c) == ESP_OK);
+    assert(startup_pulses == before + 1 && startup_delay_ticks == pdMS_TO_TICKS(300) + 1);
+    assert(GPIO.rmt_routed[GPIO_NUM_2]); // GPIO setup must precede RMT routing.
+    assert(send_packet(t, 0) == ESP_OK && t.reply.result == ReplyResult::Valid);
+    close_transport_or_abort(t);
+    c.startup_low_ms = 0;
+    assert(open_transport(t, GPIO_NUM_2, c) == ESP_OK && startup_pulses == before + 1);
+    close_transport_or_abort(t);
+    c.startup_low_ms = 300;
+    for (auto* failure : {&fail_startup_level, &fail_startup_output}) {
+        *failure = true;
+        assert(open_transport(t, GPIO_NUM_2, c) == ESP_FAIL);
+        assert(!pad_driven(GPIO_NUM_2) && !t.opened && channels == 0);
+    }
+    assert(startup_pulses == before + 1); // Failed setup must not wait or allocate RMT.
+    clean();
+    std::puts("PASS: optional startup low hold, RMT route preservation, disabled hold and GPIO setup rollback");
 }
 
 void test_lifecycle() {
@@ -473,7 +501,16 @@ void test_bidirectional_transport() {
     assert(!pad_driven(GPIO_NUM_2));
     silence=true;
     assert(send_packet(t,0) == ESP_OK && t.reply.result == ReplyResult::NoResponse);
-    assert(!t.rx_enabled && !t.faulted);
+    assert(t.rx_enabled && !t.faulted && !t.rx_timed_out);
+    assert(t.rx_count == 0); // Echo alone cannot become telemetry.
+    stall_receive=true;
+    assert(send_packet(t,0) == ESP_OK && t.reply.result == ReplyResult::NoResponse);
+    assert(!t.rx_enabled && !t.faulted && t.rx_timed_out);
+    stall_receive=false;
+    silence=false; empty_reply=true;
+    assert(send_packet(t,0) == ESP_OK && t.reply.result == ReplyResult::NoResponse);
+    assert(t.rx_enabled && !t.rx_timed_out);
+    empty_reply=false;
     silence=false; bad_reply_crc=true;
     assert(send_packet(t,0) == ESP_OK && t.reply.result == ReplyResult::ChecksumError);
     bad_reply_crc=false; rx_overflow=true;
@@ -486,7 +523,7 @@ void test_bidirectional_transport() {
     assert(!pad_driven(GPIO_NUM_2));
     close_transport_or_abort(t); clean();
     reply_payload=0xFFF;
-    std::puts("PASS: bidirectional polarity, callback handoff, silent/corrupt/overflow RX recovery, partial allocation and TX abort");
+    std::puts("PASS: bidirectional polarity, RX before TX, echo-only idle completion, stalled/corrupt/overflow RX recovery and TX abort");
 }
 
 void test_edt_link() {
@@ -505,7 +542,7 @@ void test_edt_link() {
     step(1000000,0xFFF);
     assert(link.telemetry().speed.state == ErpmState::Stopped);
     const auto capture = link.receive_capture();
-    const auto expected = esc_reply(0xFFF);
+    const auto expected = esc_reply(0xFFF,600000,false,0,true,false);
     assert(capture.result == ReceiveResult::Valid && capture.captured_at_us == 1000000);
     assert(capture.resolution_hz == 40000000 && capture.bitrate == 600000);
     assert(capture.pulse_count == expected.size()*2);
@@ -524,7 +561,14 @@ void test_edt_link() {
     silence = true;
     step(1000000,0xFFF);
     assert(link.receive_capture().result == ReceiveResult::ChecksumError);
+    assert(link.telemetry().counters.rx_timeouts == 0 && link.telemetry().counters.empty_captures == 1);
     silence = false;
+    empty_reply = true;
+    step(1000000,0xFFF);
+    assert(link.receive_capture().result == ReceiveResult::ChecksumError);
+    assert(link.telemetry().counters.no_response == 2 && link.telemetry().counters.rx_timeouts == 0 &&
+           link.telemetry().counters.empty_captures == 2);
+    empty_reply = false;
     assert(link.request_edt(true) == ESP_OK);
     step(1000001,0xFFF); // Preamble.
     for (unsigned i=0; i<10; ++i) step(1010001+i*1200, i==6 ? 0xE00 : 0xFFF);
@@ -574,13 +618,57 @@ void test_edt_link() {
     std::puts("PASS: link eRPM publication, EDT enable/disable acknowledgement, retries, timeout, cancellation and teardown");
 }
 
+void test_silent_bidirectional_group() {
+    manual_timer = true;
+    silence = true;
+    auto c = config();
+    c.signaling = Signaling::Bidirectional;
+    Driver driver(c);
+    Link first(driver,GPIO_NUM_2), second(driver,GPIO_NUM_3);
+#if CONFIG_IDF_TARGET_ESP32S3
+    Link third(driver,GPIO_NUM_4), fourth(driver,GPIO_NUM_5);
+    const std::array<Link*,4> links{&first,&second,&third,&fourth};
+#else
+    const std::array<Link*,2> links{&first,&second};
+#endif
+    for (auto* link : links) assert(link->begin() == ESP_OK);
+    assert(driver.start() == ESP_OK);
+    eventually([] { return active_timer.load() && tasks.back()->waiting.load(); });
+    for (unsigned pass = 1; pass <= 3; ++pass) {
+        emit_alarm(active_timer.load());
+        eventually([&] { return driver.statistics().worker_iterations == pass && tasks.back()->waiting.load(); });
+        for (auto* link : links) {
+            const auto telemetry = link->telemetry();
+            assert(telemetry.counters.no_response == pass);
+            assert(telemetry.counters.empty_captures == pass && telemetry.counters.rx_timeouts == 0);
+            assert(telemetry.counters.replies == 0);
+            assert(telemetry.speed.state == ErpmState::NoData);
+        }
+    }
+    // Replies can begin on the next pass without restarting any output.
+    silence = false;
+    emit_alarm(active_timer.load());
+    eventually([&] { return driver.statistics().worker_iterations == 4 && tasks.back()->waiting.load(); });
+    for (auto* link : links) assert(link->telemetry().counters.replies == 1);
+    const auto stats = driver.statistics();
+    for (std::size_t i = 0; i < stats.link_count; ++i)
+        assert(stats.links[i].completed_frames == 4 && stats.links[i].tx_errors == 0);
+    driver.stop();
+    for (auto* link : links) link->end();
+    clean();
+    manual_timer = false;
+    std::puts("PASS: all silent outputs complete without RX timeouts and accept replies on the next pass");
+}
+
 int main() {
     test_config_and_transport(); std::puts("PASS: configuration, partial setup rollback, timeout abort and close");
+    test_startup_low_hold();
     test_lifecycle(); std::puts("PASS: lifecycle, statistics reset/retention, multi-link counts and missed slots");
     test_passthrough_callbacks();
     test_scheduler(); std::puts("PASS: GPTimer rollback/restart, 1/2/4/8 kHz periods at 100 Hz RTOS tick, dropped backlog, stop wake-up");
     test_command_integration();
     test_bidirectional_transport();
+    test_silent_bidirectional_group();
     test_edt_link();
     std::puts("PASS: command packets, completed repetitions, quiet gaps, cancellation, cooldowns and faults");
     clean();

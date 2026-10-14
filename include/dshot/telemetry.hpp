@@ -47,6 +47,8 @@ struct TelemetryCounters {
     std::uint64_t receive_errors = 0;
     std::uint64_t erpm_frames = 0;
     std::uint64_t edt_frames = 0;
+    std::uint64_t rx_timeouts = 0; // RX completion did not arrive before the task's deadline.
+    std::uint64_t empty_captures = 0; // RX completed with no reply (empty or idle-only capture).
 };
 struct Telemetry {
     bool available = false; // True only when the link uses bidirectional signaling.

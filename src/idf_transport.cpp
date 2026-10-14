@@ -8,6 +8,7 @@
 #include "esp_attr.h"
 #include "hal/gpio_ll.h"
 #include "soc/gpio_struct.h"
+#include "freertos/task.h"
 
 namespace dshot::detail {
 namespace {
@@ -36,20 +37,9 @@ bool IRAM_ATTR received(rmt_channel_handle_t, const rmt_rx_done_event_data_t* ev
 
 bool IRAM_ATTR transmitted(rmt_channel_handle_t, const rmt_tx_done_event_data_t*, void* context) {
     auto& t = *static_cast<RmtTransport*>(context);
-    BaseType_t wake = pdFALSE;
-    portENTER_CRITICAL_ISR(&t.rx_lock);
-    // RMT keeps the pin driven high after transmission.
+    // RMT keeps the pin driven high after transmission(?)
     gpio_ll_output_disable(&GPIO, t.gpio);
-    if (t.accept_rx) {
-        t.rx_error = rmt_receive(t.rx_channel, t.rx_symbols,
-                                 sizeof(t.rx_symbols), &t.receive_config);
-        if (t.rx_error != ESP_OK) {
-            t.accept_rx = false;
-            xSemaphoreGiveFromISR(t.rx_done, &wake);
-        }
-    }
-    portEXIT_CRITICAL_ISR(&t.rx_lock);
-    return wake == pdTRUE;
+    return false;
 }
 
 void retire_receive(RmtTransport& t) {
@@ -75,6 +65,17 @@ esp_err_t open_transport(RmtTransport& transport, gpio_num_t gpio, const Config&
     BitTiming timing{};
     error = calculate_bit_timing(config.protocol, kRMTResolutionHz, timing);
     if (error != ESP_OK) return error;
+
+    if (config.startup_low_ms) {
+        // AM32's bootloader can stay in serial mode if the signal starts high.
+        // Configure GPIO before allocating RMT: gpio_set_direction() otherwise
+        // disconnects the RMT output route in IDF 6.1.
+        error = gpio_set_level(gpio, 0);
+        if (error == ESP_OK) error = gpio_set_direction(gpio, GPIO_MODE_OUTPUT_OD);
+        if (error == ESP_OK) vTaskDelay(pdMS_TO_TICKS(config.startup_low_ms) + 1);
+        require_disabled(gpio_set_direction(gpio, GPIO_MODE_DISABLE));
+        if (error != ESP_OK) return error;
+    }
 
     rmt_tx_channel_config_t channel_config{};
     channel_config.gpio_num = gpio;
@@ -139,6 +140,7 @@ esp_err_t send_packet(RmtTransport& transport, std::uint16_t packet,
                       std::uint64_t* wait_us) {
     if (wait_us) *wait_us = 0;
     transport.rx_wait_us = 0;
+    transport.rx_timed_out = false;
     transport.reply = {};
     if (!transport.opened || !transport.enabled || transport.faulted || transport.in_flight) {
         return ESP_ERR_INVALID_STATE;
@@ -161,6 +163,18 @@ esp_err_t send_packet(RmtTransport& transport, std::uint16_t packet,
         transport.accept_rx = true;
         portEXIT_CRITICAL(&transport.rx_lock);
         gpio_ll_output_enable(&GPIO, transport.gpio);
+        // Capture our TX edges as well as the reply. A silent ESC then reaches
+        // the hardware idle limit instead of waiting for the task timeout.
+        // RX is also ready before the ESC can start its turnaround response.
+        const auto rx_error = rmt_receive(transport.rx_channel, transport.rx_symbols,
+                                          sizeof(transport.rx_symbols), &transport.receive_config);
+        if (rx_error != ESP_OK) {
+            portENTER_CRITICAL(&transport.rx_lock);
+            transport.rx_error = rx_error;
+            transport.accept_rx = false;
+            portEXIT_CRITICAL(&transport.rx_lock);
+            xSemaphoreGive(transport.rx_done);
+        }
     }
 
     rmt_transmit_config_t transmit_config{};
@@ -197,6 +211,7 @@ esp_err_t send_packet(RmtTransport& transport, std::uint16_t packet,
     if (transport.bidirectional && error == ESP_OK) {
         const auto rx_started = esp_timer_get_time();
         const bool done = xSemaphoreTake(transport.rx_done, pdMS_TO_TICKS(2) + 1) == pdTRUE;
+        transport.rx_timed_out = !done;
         portENTER_CRITICAL(&transport.rx_lock);
         transport.accept_rx = false;
         const auto rx_error = transport.rx_error;
@@ -207,8 +222,10 @@ esp_err_t send_packet(RmtTransport& transport, std::uint16_t packet,
             transport.reply.result = done ? ReplyResult::ReceiveError : ReplyResult::NoResponse;
         } else if (count >= 32) {
             transport.reply.result = ReplyResult::Overflow;
+        } else if (!strip_transmit_echo(transport.rx_symbols, transport.rx_count, transport.symbols)) {
+            transport.reply.result = ReplyResult::Malformed;
         } else {
-            transport.reply = decode_reply(transport.rx_symbols,count,kRMTResolutionHz,transport.bitrate);
+            transport.reply = decode_reply(transport.rx_symbols,transport.rx_count,kRMTResolutionHz,transport.bitrate);
         }
         transport.rx_wait_us = esp_timer_get_time() - rx_started;
     }

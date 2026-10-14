@@ -1,0 +1,26 @@
+menu "DShot four-motor bench"
+    config DSHOT_BENCH_GPIO
+        int "Motor 1 (FL) signal GPIO"
+        range 0 48
+        default 18
+
+    config DSHOT_BENCH_GPIO_2
+        int "Motor 2 (FR) signal GPIO"
+        range 0 48
+        default 39
+
+    config DSHOT_BENCH_GPIO_3
+        int "Motor 3 (RL) signal GPIO"
+        range 0 48
+        default 38
+
+    config DSHOT_BENCH_GPIO_4
+        int "Motor 4 (RR) signal GPIO"
+        range 0 48
+        default 40
+
+    config DSHOT_BENCH_ARM_HOLD_MS
+        int "Zero-frame arming time (milliseconds)"
+        range 0 30000
+        default 5000
+endmenu

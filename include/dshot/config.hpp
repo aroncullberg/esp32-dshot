@@ -32,5 +32,6 @@ namespace dshot {
             unsigned edt_version; // Version 1 reports debug3. Version 2 reports stress and counts status events. (BIG MAYBE ON THIS)
             unsigned edt_response_timeout_ms;
             unsigned edt_attempts;
+            unsigned startup_low_ms; // Optional low hold before each Link::begin(), seems to be needed for am32(?)
     };
 }

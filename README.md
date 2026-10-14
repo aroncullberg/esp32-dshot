@@ -16,11 +16,15 @@ It's intended to be used alongside [esp32-esc-passthrough](https://github.com/ar
 
 Only tested on ESP32-C3 and ESP32-S3. Other ESP32 chips should work, but you'll need to try and verify them yourself. The component manifest currently lists only C3 and S3.
 
-It should work with both Bluejay and AM32 ESC firmware, but only Bluejay has been tested so far.
+Tested with Bluejay and AM32 ESC firmware.
 
 ## Example
 
 The [bench example](examples/bench/README.md) includes build instructions and a serial console for running a motor, sending ESC commands, and reading telemetry and statistics.
+
+The [four-motor bench](examples/bench4/README.md) supports an ESP32-S3 and a 4-in-1 ESC.
+
+If an AM32 ESC stays in its bootloader, set `config.startup_low_ms = 300` before constructing the driver.
 
 To use it in your own ESP-IDF project, place this repo in `components/dshot` or add it to `EXTRA_COMPONENT_DIRS`.
 

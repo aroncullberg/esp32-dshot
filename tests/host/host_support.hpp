@@ -10,6 +10,7 @@
 #include <vector>
 #include "dshot/config.hpp"
 #include "driver/gptimer.h"
+#include "freertos/FreeRTOS.h"
 
 struct HostTask {
     std::mutex mutex;
@@ -47,8 +48,13 @@ extern bool manual_timer;
 extern std::atomic<HostTimer*> active_timer;
 extern std::atomic<std::int64_t> command_clock_us;
 extern bool silence, bad_reply_crc, rx_overflow, fail_rx_new;
+extern bool empty_reply;
+extern bool stall_receive;
 extern bool fail_receive, fail_rx_register, fail_tx_register, fail_rx_enable;
 extern std::uint16_t reply_payload;
+extern bool fail_startup_level, fail_startup_output;
+extern unsigned startup_pulses;
+extern TickType_t startup_delay_ticks;
 
 void clean();
 dshot::Config config();

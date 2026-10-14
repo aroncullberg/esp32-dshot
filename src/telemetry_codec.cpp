@@ -1,6 +1,67 @@
 #include "telemetry_codec.hpp"
 
 namespace dshot::detail {
+bool strip_transmit_echo(rmt_symbol_word_t* symbols, std::size_t& count,
+                         const SymbolFrame& transmitted) {
+    if (!count) return true;
+    if (!symbols) return false;
+    const auto halves = count * 2;
+    const auto ticks = [&](std::size_t i) {
+        return i % 2 ? symbols[i / 2].duration1 : symbols[i / 2].duration0;
+    };
+    const auto level = [&](std::size_t i) {
+        return i % 2 ? symbols[i / 2].level1 : symbols[i / 2].level0;
+    };
+    // The receiver may include the initial idle-high interval.
+    std::size_t start = 0;
+    while (start < halves && level(start) == 1 && ticks(start)) ++start;
+    if (start == halves || !ticks(start)) {
+        for (auto i = start; i < halves; ++i) if (ticks(i)) return false;
+        count = 0;
+        return true;
+    }
+    const unsigned tolerance = transmitted[0].duration0 + transmitted[0].duration1;
+    const auto matches = [&](unsigned actual, unsigned expected) {
+        const auto difference = actual > expected ? actual - expected : expected - actual;
+        return difference <= tolerance / 8 + 1;
+    };
+    for (std::size_t bit = 0; bit < transmitted.size(); ++bit) {
+        const auto low = start + bit * 2;
+        const auto high = low + 1;
+        if (high >= halves || level(low) != 0 ||
+            !matches(ticks(low), transmitted[bit].duration0)) return false;
+        if (!ticks(high)) {
+            if (bit != transmitted.size() - 1) return false;
+            for (auto i = high; i < halves; ++i) if (ticks(i)) return false;
+            count = 0;
+            return true;
+        }
+        if (level(high) != 1) return false;
+        // The last high pulse merges with the turnaround gap and idle.
+        if (bit != transmitted.size() - 1 &&
+            !matches(ticks(high), transmitted[bit].duration1)) return false;
+        if (bit == transmitted.size() - 1 &&
+            ticks(high) + tolerance / 8 + 1 < transmitted[bit].duration1) return false;
+    }
+    const auto offset = start + transmitted.size() * 2;
+    const auto remaining = halves - offset;
+    // Read each half before overwriting it: an odd offset changes symbol pairing.
+    for (std::size_t i = 0; i < remaining; ++i) {
+        const unsigned duration = ticks(offset + i), value = level(offset + i);
+        if (i % 2) {
+            symbols[i / 2].duration1 = duration;
+            symbols[i / 2].level1 = value;
+        } else {
+            symbols[i / 2] = {};
+            symbols[i / 2].duration0 = duration;
+            symbols[i / 2].level0 = value;
+        }
+    }
+    count = (remaining + 1) / 2;
+    while (count && !symbols[count - 1].duration0 && !symbols[count - 1].duration1) --count;
+    return true;
+}
+
 DecodedReply decode_gcr(std::uint32_t gcr) {
     // Protocol's 4b/5b alphabet, indexed by decoded nibble.
     constexpr std::uint8_t alphabet[] = {

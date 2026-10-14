@@ -63,6 +63,45 @@ void test_telemetry_codec() {
 
 }
 
+void test_transmit_echo() {
+    std::size_t empty_count = 0;
+    assert(strip_transmit_echo(nullptr, empty_count, SymbolFrame{}));
+    for (const auto bitrate : {300000u, 600000u}) {
+        BitTiming timing{};
+        assert(calculate_bit_timing(static_cast<Protocol>(bitrate), 40000000, timing) == ESP_OK);
+        for (const auto packet : {0x000Fu, 0xFFFFu, 0xA55Au}) {
+            SymbolFrame frame{};
+            assert(encode_regular_symbols(packet, timing, frame) == ESP_OK);
+            for (auto& symbol : frame) { symbol.level0 = 0; symbol.level1 = 1; }
+            for (const bool leading_idle : {false, true}) {
+                for (const bool zero_end_marker : {false, true}) {
+                    auto capture = exchange_capture(frame, {}, leading_idle, zero_end_marker);
+                    auto count = capture.size();
+                    assert(strip_transmit_echo(capture.data(), count, frame));
+                    assert(decode_reply(capture.data(), count, 40000000, bitrate).result == ReplyResult::NoResponse);
+                    for (unsigned payload = 0; payload < 4096; ++payload) {
+                        const auto reply = esc_reply(payload, bitrate, false, 0, zero_end_marker);
+                        capture = exchange_capture(frame, reply, leading_idle, zero_end_marker, payload % 2 ? -2 : 2);
+                        assert(capture.size() < 32); // TX + worst-case reply fits the transport buffer.
+                        count = capture.size();
+                        assert(strip_transmit_echo(capture.data(), count, frame));
+                        const auto decoded = decode_reply(capture.data(), count, 40000000, bitrate);
+                        assert(decoded.result == ReplyResult::Valid && decoded.payload == payload);
+                    }
+                }
+            }
+            auto corrupt = exchange_capture(frame, esc_reply(0xFFF, bitrate));
+            corrupt[3].duration0 = 1;
+            auto count = corrupt.size();
+            assert(!strip_transmit_echo(corrupt.data(), count, frame));
+            corrupt = exchange_capture(frame, esc_reply(0xFFF, bitrate));
+            corrupt.resize(8); // Truncated TX must not be decoded as a reply.
+            count = corrupt.size();
+            assert(!strip_transmit_echo(corrupt.data(), count, frame));
+        }
+    }
+}
+
 void test_telemetry_state() {
     Config config;
     config.motor_poles = 14;
@@ -132,6 +171,8 @@ void test_telemetry_state() {
 void run_telemetry_tests() {
     test_telemetry_codec();
     std::puts("PASS: telemetry codec");
+    test_transmit_echo();
+    std::puts("PASS: TX echo removal, silent completion, D300/D600 replies, symbol alignment and corrupt/truncated TX rejection");
     test_telemetry_state();
     std::puts("PASS: telemetry state");
 }

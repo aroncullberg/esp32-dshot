@@ -42,6 +42,7 @@ struct RmtTransport {
     rmt_symbol_word_t rx_symbols[32]{};
     rmt_receive_config_t receive_config{};
     DecodedReply reply;
+    bool rx_timed_out = false;
     std::uint64_t rx_wait_us = 0;
 };
 

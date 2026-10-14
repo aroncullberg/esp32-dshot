@@ -173,6 +173,10 @@ esp_err_t Link::transmit_pending(std::uint64_t* wait_us, bool& transmitted, std:
         if (transmitted && impl_->transport.bidirectional) {
             const auto& transport = impl_->transport;
             telemetry.ingest(transport.reply,now);
+            if (transport.reply.result == detail::ReplyResult::NoResponse) {
+                if (transport.rx_timed_out) ++telemetry.data.counters.rx_timeouts;
+                else ++telemetry.data.counters.empty_captures;
+            }
             // Lifecycle calls serialize changes to opened.
             if (transport.rx_count && transport.reply.result != detail::ReplyResult::NoResponse &&
                 transport.reply.result != detail::ReplyResult::ReceiveError) {

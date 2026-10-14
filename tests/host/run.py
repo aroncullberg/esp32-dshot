@@ -49,7 +49,7 @@ def idf_includes(build):
     return includes
 
 
-def run_suite(name, sources, compiler, build, includes, diagnostics=0):
+def run_suite(name, sources, compiler, build, includes, diagnostics=0, defines=()):
     print(f"Running {name}", flush=True)
     with tempfile.TemporaryDirectory(prefix="dshot-host-") as temporary:
         binary = Path(temporary) / name
@@ -57,7 +57,10 @@ def run_suite(name, sources, compiler, build, includes, diagnostics=0):
             f'#include "{build / "config/sdkconfig.h"}"\n'
             '#undef CONFIG_DSHOT_TIMING_DIAGNOSTICS\n'
             '#undef CONFIG_FREERTOS_HZ\n#define CONFIG_FREERTOS_HZ 100\n'
-            f'#define CONFIG_DSHOT_TIMING_DIAGNOSTICS {diagnostics}\n')
+            '#ifndef CONFIG_DSHOT_DEFAULT_STARTUP_LOW_MS\n#define CONFIG_DSHOT_DEFAULT_STARTUP_LOW_MS 0\n#endif\n'
+            f'#define CONFIG_DSHOT_TIMING_DIAGNOSTICS {diagnostics}\n' +
+            ''.join(f'#undef {name}\n#define {name} {value}\n'
+                    for name, value in (define.split('=', 1) for define in defines)))
         command = [
             *compiler, "-std=c++17", "-pthread", "-Wall", "-Wextra", "-Werror",
             "-Wno-extern-c-compat", "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
@@ -85,6 +88,9 @@ def main():
             run_suite(f"driver_integration_test_{diagnostics}", INTEGRATION_SOURCES,
                       compiler, build, includes, diagnostics)
         run_suite("bench_console_test", BENCH_SOURCES, compiler, build, includes)
+        run_suite("bench4_console_test", BENCH_SOURCES, compiler, build, includes,
+                  defines=("DSHOT_BENCH_FOUR_MOTORS=1", "CONFIG_DSHOT_BENCH_GPIO_2=3",
+                           "CONFIG_DSHOT_BENCH_GPIO_3=4", "CONFIG_DSHOT_BENCH_GPIO_4=5"))
     except (OSError, ValueError, KeyError) as error:
         parser.exit(1, f"error: {error}\n")
     except subprocess.CalledProcessError as error:

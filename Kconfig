@@ -43,6 +43,17 @@ menu "DShot"
             This supplies Config::motor_poles; C++ can override the default.
             The default is retained when regular signaling hides this option.
 
+    config DSHOT_DEFAULT_STARTUP_LOW_MS
+        int "Default signal-low hold before opening each output (milliseconds)"
+        range 0 1000
+        default 0
+        help
+            Set to 300 for AM32 ESCs that remain in their serial bootloader when
+            the signal starts high. Each Link::begin() holds the pin low using
+            open drain, releases it, then allocates RMT. Zero disables the hold.
+            This adds startup time only; it does not change the packet cadence.
+            Config::startup_low_ms can override this constructor default.
+
     config DSHOT_DEFAULT_FRAME_HZ
         int "Default frames per second"
         range 100 8000
