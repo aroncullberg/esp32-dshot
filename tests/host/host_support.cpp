@@ -21,6 +21,8 @@ struct HostSemaphore {
 struct rmt_channel_t {
     bool enabled = false;
     bool active = false;
+    bool completed = false;
+    bool wait_failed = false;
     const rmt_symbol_word_t* buffer = nullptr;
     std::array<std::uint32_t, 16> submitted{};
     bool rx = false;
@@ -37,6 +39,8 @@ std::atomic<int> channels{0}, encoders{0};
 std::atomic<bool> fail_channel{false}, fail_encoder{false}, fail_enable{false};
 std::atomic<bool> fail_task{false}, fail_submit{false}, fail_wait{false};
 int fail_tx_channel_after = -1;
+int fail_submit_after = -1;
+std::atomic<unsigned> max_in_flight{0}, blocking_tx_waits{0};
 std::mutex wire_mutex;
 std::condition_variable wire_changed;
 bool hold_wait = false, entered_wait = false;
@@ -51,10 +55,14 @@ bool manual_timer = false;
 std::atomic<HostTimer*> active_timer{nullptr};
 const auto clock_start = std::chrono::steady_clock::now();
 std::atomic<std::int64_t> command_clock_us{-1};
+std::atomic<std::int64_t> tick_clock{-1};
+TickType_t last_rx_wait_ticks = 0;
 std::array<rmt_channel_handle_t,49> receivers{};
+std::array<rmt_channel_handle_t,49> transmitters{};
 bool silence = false, bad_reply_crc = false, rx_overflow = false, fail_rx_new = false;
 bool empty_reply = false;
 bool stall_receive = false;
+int stall_rx_gpio = -1;
 bool fail_receive = false, fail_rx_register = false, fail_tx_register = false, fail_rx_enable = false;
 std::uint16_t reply_payload = 0xFFF;
 bool fail_startup_level = false, fail_startup_output = false;
@@ -82,8 +90,69 @@ Config config() {
 }
 }
 
+namespace {
+void complete_transmission(rmt_channel_handle_t channel) {
+    if (!channel->active || channel->wait_failed) return;
+    if (fail_wait.exchange(false)) { channel->wait_failed = true; return; }
+    std::unique_lock lock(wire_mutex);
+    entered_wait = true;
+    wire_changed.notify_all();
+    wire_changed.wait(lock, [] { return !hold_wait; });
+    std::uint16_t packet = 0;
+    for (unsigned i = 0; i < 16; ++i) {
+        const auto& symbol = channel->buffer[i];
+        assert(symbol.val == channel->submitted[i]); // No overwrite during pending TX.
+        assert(symbol.level0 == (channel->idle ? 0u : 1u) && symbol.level1 == channel->idle);
+        assert(symbol.duration0 + symbol.duration1 == 67);
+        assert(symbol.duration0 == 25 || symbol.duration0 == 50);
+        packet = (packet << 1) | (symbol.duration0 == 50);
+    }
+    wire_packets.push_back(packet);
+    SymbolFrame frame{};
+    std::copy_n(channel->buffer, frame.size(), frame.begin());
+    channel->active = false;
+    channel->completed = true;
+    channel->buffer = nullptr;
+    wire_changed.notify_all();
+    lock.unlock();
+    if (channel->tx_callback) {
+        rmt_tx_done_event_data_t event{17};
+        channel->tx_callback(channel,&event,channel->context);
+        auto* rx = receivers[channel->gpio];
+        assert(!pad_driven(channel->gpio)); // TX-done must release the pin for the ESC.
+        if (rx && rx->active && !stall_receive && channel->gpio != stall_rx_gpio) {
+            const auto capture=empty_reply ? std::vector<rmt_symbol_word_t>{} :
+                exchange_capture(frame, silence ? std::vector<rmt_symbol_word_t>{} :
+                    esc_reply(reply_payload,600000,bad_reply_crc));
+            std::copy(capture.begin(),capture.end(),rx->rx_buffer);
+            rx->active=false;
+            rmt_rx_done_event_data_t received{};
+            received.received_symbols=rx->rx_buffer;
+            received.num_symbols=rx_overflow ? 32 : capture.size();
+            rx->rx_callback(rx,&received,rx->context);
+        }
+    }
+}
+}
+
+void host_test::complete_tx(gpio_num_t gpio) {
+    assert(transmitters[gpio]);
+    complete_transmission(transmitters[gpio]);
+}
+
 SemaphoreHandle_t xSemaphoreCreateBinary() { return new HostSemaphore; }
 BaseType_t xSemaphoreTake(SemaphoreHandle_t semaphore, TickType_t timeout) {
+    // Hardware runs independently of TX queue collection. Complete submitted
+    // channels when the worker waits for RX, including callbacks before take.
+    for (auto* rx : receivers) {
+        if (rx && rx->context) {
+            auto& transport = *static_cast<RmtTransport*>(rx->context);
+            if (transport.rx_done != semaphore || !transport.in_flight) continue;
+            last_rx_wait_ticks = timeout;
+            for (auto* tx : transmitters) if (tx) complete_transmission(tx);
+            break;
+        }
+    }
     std::unique_lock lock(semaphore->mutex);
     if (timeout == portMAX_DELAY) semaphore->changed.wait(lock, [&] { return semaphore->token; });
     else if (!semaphore->changed.wait_for(lock, std::chrono::milliseconds(timeout), [&] { return semaphore->token; })) return pdFALSE;
@@ -157,6 +226,7 @@ std::uint32_t ulTaskNotifyTake(BaseType_t clear, TickType_t timeout) {
     return result;
 }
 TickType_t xTaskGetTickCount() {
+    if (const auto now = tick_clock.load(); now >= 0) return static_cast<TickType_t>(now);
     return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - clock_start).count();
 }
@@ -307,6 +377,7 @@ esp_err_t rmt_new_tx_channel(const rmt_tx_channel_config_t* config, rmt_channel_
     if (fail_tx_channel_after > 0) --fail_tx_channel_after;
     *out = new rmt_channel_t;
     (*out)->gpio=config->gpio_num; (*out)->idle=config->flags.init_level;
+    transmitters[config->gpio_num] = *out;
     GPIO.enabled[config->gpio_num] = true;
     GPIO.peripheral_oe[config->gpio_num] = true;
     GPIO.rmt_routed[config->gpio_num] = true;
@@ -329,6 +400,8 @@ esp_err_t rmt_enable(rmt_channel_handle_t channel) {
 esp_err_t rmt_disable(rmt_channel_handle_t channel) {
     assert(channel->enabled);
     channel->active = false;
+    channel->completed = false;
+    channel->wait_failed = false;
     channel->buffer = nullptr;
     channel->enabled = false;
     return ESP_OK;
@@ -336,6 +409,7 @@ esp_err_t rmt_disable(rmt_channel_handle_t channel) {
 esp_err_t rmt_del_channel(rmt_channel_handle_t channel) {
     assert(!channel->enabled && !channel->active);
     if (channel->rx) receivers[channel->gpio]=nullptr;
+    else transmitters[channel->gpio]=nullptr;
     delete channel;
     --channels;
     return ESP_OK;
@@ -355,51 +429,24 @@ esp_err_t rmt_transmit(rmt_channel_handle_t channel, rmt_encoder_handle_t,
         assert(GPIO.rmt_routed[channel->gpio]);
     }
     if (fail_submit.exchange(false)) return ESP_FAIL;
+    if (fail_submit_after == 0) { fail_submit_after = -1; return ESP_FAIL; }
+    if (fail_submit_after > 0) --fail_submit_after;
     channel->active = true;
+    channel->completed = false;
     channel->buffer = static_cast<const rmt_symbol_word_t*>(payload);
     for (unsigned i = 0; i < 16; ++i) channel->submitted[i] = channel->buffer[i].val;
+    const unsigned active = std::count_if(transmitters.begin(), transmitters.end(),
+        [](auto* tx) { return tx && tx->active; });
+    max_in_flight = std::max(max_in_flight.load(), active);
     return ESP_OK;
 }
 esp_err_t rmt_tx_wait_all_done(rmt_channel_handle_t channel, int timeout_ms) {
-    assert(timeout_ms == 20 && channel->active);
-    if (fail_wait.exchange(false)) return ESP_ERR_TIMEOUT; // Remains active until abort.
-    std::unique_lock lock(wire_mutex);
-    entered_wait = true;
-    wire_changed.notify_all();
-    wire_changed.wait(lock, [] { return !hold_wait; });
-    std::uint16_t packet = 0;
-    for (unsigned i = 0; i < 16; ++i) {
-        const auto& symbol = channel->buffer[i];
-        assert(symbol.val == channel->submitted[i]); // No overwrite during pending TX.
-        assert(symbol.level0 == (channel->idle ? 0u : 1u) && symbol.level1 == channel->idle);
-        assert(symbol.duration0 + symbol.duration1 == 67);
-        assert(symbol.duration0 == 25 || symbol.duration0 == 50);
-        packet = (packet << 1) | (symbol.duration0 == 50);
-    }
-    wire_packets.push_back(packet);
-    SymbolFrame frame{};
-    std::copy_n(channel->buffer, frame.size(), frame.begin());
-    channel->active = false;
-    channel->buffer = nullptr;
-    wire_changed.notify_all();
-    lock.unlock();
-    if (channel->tx_callback) {
-        rmt_tx_done_event_data_t event{17};
-        channel->tx_callback(channel,&event,channel->context);
-        auto* rx = receivers[channel->gpio];
-        assert(!pad_driven(channel->gpio)); // TX-done must release the pin for the ESC.
-        if (rx && rx->active && !stall_receive) {
-            const auto capture=empty_reply ? std::vector<rmt_symbol_word_t>{} :
-                exchange_capture(frame, silence ? std::vector<rmt_symbol_word_t>{} :
-                    esc_reply(reply_payload,600000,bad_reply_crc));
-            std::copy(capture.begin(),capture.end(),rx->rx_buffer);
-            rx->active=false;
-            rmt_rx_done_event_data_t received{};
-            received.received_symbols=rx->rx_buffer;
-            received.num_symbols=rx_overflow ? 32 : capture.size();
-            rx->rx_callback(rx,&received,rx->context);
-        }
-    }
+    assert(timeout_ms == 20);
+    if (channel->active && channel->tx_callback) ++blocking_tx_waits;
+    complete_transmission(channel);
+    if (channel->wait_failed) return ESP_ERR_TIMEOUT; // Remains active until abort.
+    assert(channel->completed);
+    channel->completed = false;
     return ESP_OK;
 }
 }

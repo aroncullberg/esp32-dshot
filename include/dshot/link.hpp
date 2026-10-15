@@ -38,8 +38,10 @@ private:
     friend class Driver;
     friend class Passthrough;
     bool ready() const;
-    esp_err_t transmit_pending(std::uint64_t* wait_us, bool& transmitted, std::uint64_t& rx_wait_us,
-                              detail::StageProfiler* profile = nullptr);
+    esp_err_t start_pending(bool& submitted, detail::StageProfiler* profile);
+    esp_err_t finish_pending(std::uint64_t* wait_us, std::uint64_t& rx_wait_us,
+                             detail::StageProfiler* profile);
+    void complete_pending(esp_err_t error, detail::StageProfiler* profile);
     void cancel_pending_command();
 
     struct Impl;

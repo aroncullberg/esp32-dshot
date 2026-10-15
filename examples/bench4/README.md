@@ -69,3 +69,31 @@ The stage table separates frame preparation, symbol encoding, RX setup, TX submi
 - `est core %`: extrapolates the sampled busy time across the window's worker updates. Sampling bias and instrumentation overhead affect this estimate; it is not an exact reconciliation with the task runtime table.
 
 The empty probe row measures the timestamp-pair overhead; compare small stage timings against it. Probe overhead is reported rather than subtracted. Scheduler work before/after the sampled pass and the cost of merging samples are outside the stage table. `idle clamps` counts boundaries where idle accounting slightly exceeds elapsed time; their busy time is clamped to zero. Compare `profile 5 basic` with `profile 5` at the same workload to assess added measurement overhead.
+
+### Batched transport
+
+Each worker update starts every active motor's exchange before collecting any
+results. Channels start in submission order; this does not synchronize their
+edges. Each motor keeps its own TX/RX buffers and completion semaphore.
+
+In bidirectional mode the worker waits for RX first. The TX interrupt releases
+the pin independently, and TX completion is normally already queued when the
+worker collects it afterward. A bounded TX wait remains for early RX events and
+fault recovery. RX timeout budgets start when each receiver is armed, so later
+motors do not each add a fresh full timeout during collection.
+
+Stop and errors drain every exchange already submitted. A command pause skips
+only that motor's submission. A partial submission failure stops further
+submissions while preserving completion and cleanup of earlier motors.
+
+Stage visits still count individual motors; later motors may have nearly zero
+RX wait because their replies arrived during other work. The old detailed
+`RX wait` statistic now excludes decoding. Detailed per-link elapsed intervals
+overlap and must not be summed; use the worker-pass interval for total update
+latency. Measure CPU with `profile 5 basic` and inspect stages with `profile 5`,
+then repeat under competing load. The [recorded bench measurements](PROFILING_RESULTS.md)
+show basic worker CPU falling from 28.34% to 21.03% after these transport changes,
+or from 38.80% to 21.03% across all optimization steps (45.8% less worker CPU).
+The final basic five-second window had 5,009 valid replies per motor, no
+TX/RX/decode errors, and one missed slot. The final sampled-stage windows measured
+22.48% at raw 0 and 22.28% at raw 100, with zero missed slots and no errors.

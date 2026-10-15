@@ -16,6 +16,7 @@ struct Link::Impl {
     portMUX_TYPE pending_lock = portMUX_INITIALIZER_UNLOCKED;
     std::uint16_t pending_body = 0;
     detail::CommandSequence sequence;
+    detail::CommandFrame active_frame;
     detail::TelemetryState telemetry;
     ReceiveCapture capture;
 };
@@ -142,11 +143,9 @@ void Link::cancel_pending_command() {
     portEXIT_CRITICAL(&impl_->pending_lock);
 }
 
-esp_err_t Link::transmit_pending(std::uint64_t* wait_us, bool& transmitted, std::uint64_t& rx_wait_us,
-                                 detail::StageProfiler* profile) {
+esp_err_t Link::start_pending(bool& submitted, detail::StageProfiler* profile) {
     detail::profile_stage(profile, ProfileStage::FramePrepare);
-    transmitted = false;
-    rx_wait_us = 0;
+    submitted = false;
     if (!ready()) return ESP_ERR_INVALID_STATE;
     portENTER_CRITICAL(&impl_->pending_lock);
     auto& telemetry = impl_->telemetry;
@@ -167,12 +166,28 @@ esp_err_t Link::transmit_pending(std::uint64_t* wait_us, bool& transmitted, std:
         impl_->sequence.active() ? esp_timer_get_time() : 0);
     portEXIT_CRITICAL(&impl_->pending_lock);
     if (!frame.send) return ESP_OK;
+    impl_->active_frame = frame;
     const auto body = frame.body;
     std::uint16_t packet;
     auto error = detail::encode_regular_packet(body >> 1, (body & 1) != 0, packet);
-    if (error == ESP_OK) error = detail::send_packet(impl_->transport, packet, wait_us, profile);
+    if (error == ESP_OK) error = detail::start_packet(impl_->transport, packet, profile);
+    submitted = error == ESP_OK;
+    if (error != ESP_OK) complete_pending(error, profile);
+    return error;
+}
+
+esp_err_t Link::finish_pending(std::uint64_t* wait_us, std::uint64_t& rx_wait_us,
+                               detail::StageProfiler* profile) {
+    const auto error = detail::finish_packet(impl_->transport, wait_us, profile);
+    complete_pending(error, profile);
+    rx_wait_us = impl_->transport.rx_wait_us;
+    return error;
+}
+
+void Link::complete_pending(esp_err_t error, detail::StageProfiler* profile) {
     detail::profile_stage(profile, ProfileStage::TelemetryUpdate);
-    transmitted = error == ESP_OK;
+    const auto& frame = impl_->active_frame;
+    auto& telemetry = impl_->telemetry;
     if (frame.id != 0 || impl_->transport.bidirectional) {
         const auto now = esp_timer_get_time();
         portENTER_CRITICAL(&impl_->pending_lock);
@@ -182,7 +197,7 @@ esp_err_t Link::transmit_pending(std::uint64_t* wait_us, bool& transmitted, std:
             else if (frame.command && !telemetry.deadline_us)
                 telemetry.deadline_us = now + static_cast<std::int64_t>(driver_.config_.edt_response_timeout_ms) * 1000;
         }
-        if (transmitted && impl_->transport.bidirectional) {
+        if (error == ESP_OK && impl_->transport.bidirectional) {
             const auto& transport = impl_->transport;
             telemetry.ingest(transport.reply,now);
             if (transport.reply.result == detail::ReplyResult::NoResponse) {
@@ -210,7 +225,5 @@ esp_err_t Link::transmit_pending(std::uint64_t* wait_us, bool& transmitted, std:
         detail::profile_stage(profile, ProfileStage::LinkFinish);
         portEXIT_CRITICAL(&impl_->pending_lock);
     }
-    rx_wait_us = impl_->transport.rx_wait_us;
-    return error;
 }
 }

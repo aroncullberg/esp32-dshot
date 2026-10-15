@@ -44,10 +44,16 @@ struct RmtTransport {
     rmt_receive_config_t receive_config{};
     DecodedReply reply;
     bool rx_timed_out = false;
+    TickType_t rx_started_at = 0;
     std::uint64_t rx_wait_us = 0;
 };
 
 esp_err_t open_transport(RmtTransport& transport, gpio_num_t gpio, const Config& config);
+// The symbol/RX buffers remain owned by this exchange until finish_packet().
+esp_err_t start_packet(RmtTransport& transport, std::uint16_t packet,
+                       StageProfiler* profile = nullptr);
+esp_err_t finish_packet(RmtTransport& transport, std::uint64_t* wait_us = nullptr,
+                        StageProfiler* profile = nullptr);
 esp_err_t send_packet(RmtTransport& transport, std::uint16_t packet,
                       std::uint64_t* wait_us = nullptr, StageProfiler* profile = nullptr);
 esp_err_t close_transport(RmtTransport& transport);

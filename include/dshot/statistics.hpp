@@ -36,9 +36,11 @@ struct LinkStatistics {
     std::uint64_t completed_frames = 0;
     std::uint64_t tx_errors = 0;
     std::uint64_t command_pauses = 0;
+    // Per-link submission-to-collection time minus its TX queue wait. Exchanges
+    // overlap across links; these elapsed times must not be summed across motors.
     TimingStatistics outside_tx_wait;
     TimingStatistics tx_wait;
-    TimingStatistics rx_wait;
+    TimingStatistics rx_wait; // Time waiting for RX completion, excluding decode.
     // Time between transmission completions as observed by the worker.
     TimingStatistics completion_interval;
 };

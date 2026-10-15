@@ -281,7 +281,7 @@ void print_statistics(const dshot::DriverStatistics& current,
         if (current.detailed_timing) {
             print_timing("outside TX wait", link.outside_tx_wait);
             print_timing("TX wait", link.tx_wait);
-            print_timing("RX wait/decode", link.rx_wait);
+            print_timing("RX wait", link.rx_wait);
             print_timing("completion interval", link.completion_interval);
         }
     }

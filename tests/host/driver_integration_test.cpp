@@ -530,6 +530,176 @@ void test_bidirectional_transport() {
     std::puts("PASS: bidirectional polarity, RX before TX, echo-only idle completion, stalled/corrupt/overflow RX recovery and TX abort");
 }
 
+void test_split_transport_completion() {
+    for (const auto signaling : {Signaling::Regular, Signaling::Bidirectional}) {
+        auto c = config(); c.signaling = signaling;
+        RmtTransport first, second;
+        assert(open_transport(first, GPIO_NUM_2, c) == ESP_OK);
+        assert(open_transport(second, GPIO_NUM_3, c) == ESP_OK);
+        assert(finish_packet(first) == ESP_ERR_INVALID_STATE);
+        const auto waits = blocking_tx_waits.load();
+        max_in_flight = 0;
+        assert(start_packet(first, 0x0606) == ESP_OK && first.in_flight);
+        const auto symbols = first.symbols;
+        assert(start_packet(first, 0) == ESP_ERR_INVALID_STATE);
+        for (unsigned i = 0; i < symbols.size(); ++i) assert(first.symbols[i].val == symbols[i].val);
+        assert(start_packet(second, 0x0C84) == ESP_OK && second.in_flight);
+        assert(max_in_flight == 2);
+        // Deliver independent hardware completions out of submission order.
+        // Both ISR callbacks can run before the worker takes either semaphore.
+        reply_payload = 0xFFF; complete_tx(GPIO_NUM_3);
+        reply_payload = 0x3F4; complete_tx(GPIO_NUM_2);
+        assert(!pad_driven(GPIO_NUM_2) || signaling == Signaling::Regular);
+        assert(!pad_driven(GPIO_NUM_3) || signaling == Signaling::Regular);
+        assert(finish_packet(first) == ESP_OK && !first.in_flight);
+        assert(finish_packet(second) == ESP_OK && !second.in_flight);
+        if (signaling == Signaling::Bidirectional) {
+            assert(first.reply.result == ReplyResult::Valid && first.reply.payload == 0x3F4);
+            assert(second.reply.result == ReplyResult::Valid && second.reply.payload == 0xFFF);
+            assert(blocking_tx_waits == waits);
+        }
+        assert(finish_packet(first) == ESP_ERR_INVALID_STATE);
+        close_transport_or_abort(first); close_transport_or_abort(second); clean();
+    }
+    reply_payload = 0xFFF;
+    std::puts("PASS: split transport buffers remain immutable, out-of-order callbacks retain per-motor replies, TX collection does not block after RX");
+}
+
+void test_batched_stop() {
+    manual_timer = true;
+    for (const auto signaling : {Signaling::Regular, Signaling::Bidirectional}) {
+        auto c = config(); c.signaling = signaling;
+        Driver driver(c);
+        Link first(driver,GPIO_NUM_2), second(driver,GPIO_NUM_3);
+#if CONFIG_IDF_TARGET_ESP32S3
+        Link third(driver,GPIO_NUM_4), fourth(driver,GPIO_NUM_5);
+        const std::array<Link*,4> links{&first,&second,&third,&fourth};
+#else
+        const std::array<Link*,2> links{&first,&second};
+#endif
+        for (std::size_t i = 0; i < links.size(); ++i) {
+            assert(links[i]->begin() == ESP_OK && links[i]->set(100 + i) == ESP_OK);
+        }
+        assert(driver.start() == ESP_OK);
+        eventually([] { return active_timer.load() && tasks.back()->waiting.load(); });
+        const auto waits = blocking_tx_waits.load();
+        max_in_flight = 0;
+        { std::lock_guard lock(wire_mutex); hold_wait = true; entered_wait = false; wire_packets.clear(); }
+        emit_alarm(active_timer.load());
+        eventually([] { std::lock_guard lock(wire_mutex); return entered_wait; });
+        assert(max_in_flight == links.size()); // Every motor was started before the first wait.
+        for (auto* link : links) assert(link->set(0) == ESP_OK);
+        auto stopping = std::async(std::launch::async, [&] { driver.stop(); });
+        assert(stopping.wait_for(5ms) == std::future_status::timeout);
+        { std::lock_guard lock(wire_mutex); hold_wait = false; }
+        wire_changed.notify_all();
+        assert(stopping.wait_for(2s) == std::future_status::ready);
+        stopping.get();
+        const auto stats = driver.statistics();
+        assert(!stats.running && stats.worker_iterations == 1);
+        for (std::size_t i = 0; i < links.size(); ++i) {
+            assert(stats.links[i].completed_frames == 1 && stats.links[i].tx_errors == 0);
+            if (signaling == Signaling::Bidirectional)
+                assert(links[i]->telemetry_counters().replies == 1);
+        }
+        if (signaling == Signaling::Bidirectional) assert(blocking_tx_waits == waits);
+        {
+            std::lock_guard lock(wire_mutex);
+            assert(wire_packets.size() == links.size());
+            for (std::size_t i = 0; i < links.size(); ++i) {
+                std::uint16_t expected;
+                assert(encode_regular_packet(100 + i, false, expected) == ESP_OK);
+                assert(wire_packets[i] == (signaling == Signaling::Bidirectional ? expected ^ 0xF : expected));
+            }
+        }
+        for (auto* link : links) link->end();
+        clean();
+    }
+    manual_timer = false;
+    std::puts("PASS: all motors are submitted before waiting, payload updates preserve active buffers, stop drains the complete regular/bidirectional batch");
+}
+
+void test_batch_receive_deadlines() {
+    auto c = config(); c.signaling = Signaling::Bidirectional;
+    RmtTransport first, second;
+    assert(open_transport(first, GPIO_NUM_2, c) == ESP_OK);
+    assert(open_transport(second, GPIO_NUM_3, c) == ESP_OK);
+    tick_clock = 1000;
+    assert(start_packet(first, 0) == ESP_OK && start_packet(second, 0) == ESP_OK);
+    assert(finish_packet(first) == ESP_OK);
+    const TickType_t budget = pdMS_TO_TICKS(2) + 1;
+    assert(last_rx_wait_ticks == budget);
+    tick_clock = 1000 + budget;
+    assert(finish_packet(second) == ESP_OK && second.reply.result == ReplyResult::Valid);
+    assert(last_rx_wait_ticks == 0); // A collected result does not get a fresh full timeout.
+    tick_clock = UINT32_MAX;
+    assert(start_packet(first, 0) == ESP_OK);
+    complete_tx(GPIO_NUM_2);
+    tick_clock = budget - 1; // Tick counter wrapped while the exchange was active.
+    assert(finish_packet(first) == ESP_OK && first.reply.result == ReplyResult::Valid);
+    assert(last_rx_wait_ticks == 0); // A queued completion is still accepted after the deadline.
+    tick_clock = -1;
+    close_transport_or_abort(first); close_transport_or_abort(second); clean();
+    std::puts("PASS: RX deadlines start at submission, queued replies survive expiry, tick rollover does not extend waits");
+}
+
+void test_batch_failures_and_recovery() {
+    manual_timer = true;
+    for (const auto signaling : {Signaling::Regular, Signaling::Bidirectional}) {
+        for (const bool submit_failure : {true, false}) {
+            auto c = config(); c.signaling = signaling;
+            Driver driver(c);
+            Link first(driver,GPIO_NUM_2), second(driver,GPIO_NUM_3);
+#if CONFIG_IDF_TARGET_ESP32S3
+            Link third(driver,GPIO_NUM_4), fourth(driver,GPIO_NUM_5);
+            const std::array<Link*,4> links{&first,&second,&third,&fourth};
+#else
+            const std::array<Link*,2> links{&first,&second};
+#endif
+            for (auto* link : links) assert(link->begin() == ESP_OK);
+            assert(driver.start() == ESP_OK);
+            eventually([] { return active_timer.load() && tasks.back()->waiting.load(); });
+            if (submit_failure) fail_submit_after = 1; // Fail after one motor is already active.
+            else fail_wait = true; // First TX fails after all motors have been submitted.
+            emit_alarm(active_timer.load());
+            eventually([&] { return driver.last_error() != ESP_OK; });
+            driver.stop();
+            assert(driver.last_error() == (submit_failure ? ESP_FAIL : ESP_ERR_TIMEOUT));
+            const auto stats = driver.statistics();
+            for (std::size_t i = 0; i < links.size(); ++i) {
+                const auto& link = stats.links[i];
+                if (submit_failure) {
+                    assert(link.completed_frames == (i == 0 ? 1u : 0u));
+                    assert(link.tx_errors == (i == 1 ? 1u : 0u));
+                } else {
+                    assert(link.completed_frames == (i == 0 ? 0u : 1u));
+                    assert(link.tx_errors == (i == 0 ? 1u : 0u));
+                }
+            }
+            for (auto* link : links) link->end(); // Must have no active TX left on any channel.
+            clean();
+        }
+    }
+    auto c = config(); c.signaling = Signaling::Bidirectional;
+    Driver driver(c);
+    Link first(driver,GPIO_NUM_2), second(driver,GPIO_NUM_3);
+    assert(first.begin() == ESP_OK && second.begin() == ESP_OK && driver.start() == ESP_OK);
+    eventually([] { return active_timer.load() && tasks.back()->waiting.load(); });
+    stall_rx_gpio = GPIO_NUM_2;
+    emit_alarm(active_timer.load());
+    eventually([&] { return driver.statistics().worker_iterations == 1 && tasks.back()->waiting.load(); });
+    assert(first.telemetry_counters().rx_timeouts == 1);
+    assert(second.telemetry_counters().replies == 1 && second.telemetry_counters().rx_timeouts == 0);
+    stall_rx_gpio = -1;
+    emit_alarm(active_timer.load());
+    eventually([&] { return driver.statistics().worker_iterations == 2 && tasks.back()->waiting.load(); });
+    assert(first.telemetry_counters().replies == 1 && first.telemetry_counters().rx_timeouts == 1);
+    assert(second.telemetry_counters().replies == 2 && driver.last_error() == ESP_OK);
+    first.end(); second.end(); clean();
+    manual_timer = false;
+    std::puts("PASS: partial-submit/TX failures drain other active motors; a stalled receiver leaves other replies intact and recovers next pass");
+}
+
 void test_edt_link() {
     manual_timer=true; command_clock_us=1000000;
     auto c=config(); c.signaling=Signaling::Bidirectional; c.frame_hz=4000;
@@ -658,11 +828,31 @@ void test_silent_bidirectional_group() {
     const auto stats = driver.statistics();
     for (std::size_t i = 0; i < stats.link_count; ++i)
         assert(stats.links[i].completed_frames == 4 && stats.links[i].tx_errors == 0);
+    // A command's quiet gap skips only that motor; every other motor continues
+    // in the same batch without zero/throttle frames leaking into the command.
+    command_clock_us = 1000000;
+    assert(first.send_command(Command::DirectionNormal) == ESP_OK);
+    const auto step = [&](std::int64_t now, unsigned pass) {
+        command_clock_us = now;
+        emit_alarm(active_timer.load());
+        eventually([&] { return driver.statistics().worker_iterations == pass && tasks.back()->waiting.load(); });
+    };
+    step(1000000, 5); // Zero preamble.
+    step(1010000, 6); // First command repetition.
+    assert(first.command_status().completed_repetitions == 1);
+    max_in_flight = 0;
+    step(1010250, 7); // Quiet gap before the next repetition.
+    const auto paused = driver.statistics();
+    assert(paused.links[0].completed_frames == 6 && paused.links[0].command_pauses == 1);
+    for (std::size_t i = 1; i < links.size(); ++i)
+        assert(paused.links[i].completed_frames == 7 && paused.links[i].command_pauses == 0);
+    assert(max_in_flight == links.size() - 1);
     driver.stop();
     for (auto* link : links) link->end();
     clean();
     manual_timer = false;
-    std::puts("PASS: all silent outputs complete without RX timeouts and accept replies on the next pass");
+    command_clock_us = -1;
+    std::puts("PASS: silent outputs recover on the next pass; a motor's command quiet gap leaves the other batched outputs running");
 }
 
 void test_stage_profiling() {
@@ -726,6 +916,10 @@ int main() {
     test_scheduler(); std::puts("PASS: GPTimer rollback/restart, 1/2/4/8 kHz periods at 100 Hz RTOS tick, dropped backlog, stop wake-up");
     test_command_integration();
     test_bidirectional_transport();
+    test_split_transport_completion();
+    test_batched_stop();
+    test_batch_receive_deadlines();
+    test_batch_failures_and_recovery();
     test_silent_bidirectional_group();
     test_edt_link();
     test_stage_profiling();

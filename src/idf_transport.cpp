@@ -137,16 +137,14 @@ esp_err_t open_transport(RmtTransport& transport, gpio_num_t gpio, const Config&
     return ESP_OK;
 }
 
-esp_err_t send_packet(RmtTransport& transport, std::uint16_t packet,
-                      std::uint64_t* wait_us, StageProfiler* profile) {
+esp_err_t start_packet(RmtTransport& transport, std::uint16_t packet, StageProfiler* profile) {
     profile_stage(profile, ProfileStage::SymbolEncode);
-    if (wait_us) *wait_us = 0;
-    transport.rx_wait_us = 0;
-    transport.rx_timed_out = false;
-    transport.reply = {};
     if (!transport.opened || !transport.enabled || transport.faulted || transport.in_flight) {
         return ESP_ERR_INVALID_STATE;
     }
+    transport.rx_wait_us = 0;
+    transport.rx_timed_out = false;
+    transport.reply = {};
     // Bidirectional DShot uses a complemented checksum.
     if (transport.bidirectional) packet ^= 0xF;
     esp_err_t error = encode_regular_symbols(packet, transport.timing, transport.symbols);
@@ -170,6 +168,7 @@ esp_err_t send_packet(RmtTransport& transport, std::uint16_t packet,
         // Capture our TX edges as well as the reply. A silent ESC then reaches
         // the hardware idle limit instead of waiting for the task timeout.
         // RX is also ready before the ESC can start its turnaround response.
+        transport.rx_started_at = xTaskGetTickCount();
         const auto rx_error = rmt_receive(transport.rx_channel, transport.rx_symbols,
                                           sizeof(transport.rx_symbols), &transport.receive_config);
         if (rx_error != ESP_OK) {
@@ -199,11 +198,41 @@ esp_err_t send_packet(RmtTransport& transport, std::uint16_t packet,
         return error;
     }
     transport.in_flight = true;
+    return ESP_OK;
+}
+
+esp_err_t finish_packet(RmtTransport& transport, std::uint64_t* wait_us, StageProfiler* profile) {
+    if (wait_us) *wait_us = 0;
+    if (!transport.in_flight) return ESP_ERR_INVALID_STATE;
+    bool done = false;
+    esp_err_t rx_error = ESP_OK;
+    std::size_t count = 0;
+    if (transport.bidirectional) {
+        const auto rx_started = esp_timer_get_time();
+        profile_stage(profile, ProfileStage::RxWait);
+        // All motors share the time since their submissions, rather than each
+        // receiving a fresh full timeout when their results are collected.
+        const TickType_t timeout = pdMS_TO_TICKS(2) + 1;
+        const TickType_t elapsed = xTaskGetTickCount() - transport.rx_started_at;
+        done = xSemaphoreTake(transport.rx_done, elapsed >= timeout ? 0 : timeout - elapsed) == pdTRUE;
+        profile_stage(profile, ProfileStage::RxFinish);
+        transport.rx_wait_us = esp_timer_get_time() - rx_started;
+        transport.rx_timed_out = !done;
+        portENTER_CRITICAL(&transport.rx_lock);
+        transport.accept_rx = false;
+        rx_error = transport.rx_error;
+        count = transport.rx_count;
+        portEXIT_CRITICAL(&transport.rx_lock);
+    }
+
+    // RX normally completes after the TX-done ISR has released the pin and
+    // queued TX completion. Reap that completion here without a separate sleep
+    // for TX. Keep a bounded TX wait for early/failed RX and fault recovery.
 #if CONFIG_DSHOT_TIMING_DIAGNOSTICS
     const auto wait_started = esp_timer_get_time();
 #endif
     profile_stage(profile, ProfileStage::TxWait);
-    error = rmt_tx_wait_all_done(transport.tx_channel, kTxTimeoutMs);
+    const auto error = rmt_tx_wait_all_done(transport.tx_channel, kTxTimeoutMs);
     profile_stage(profile, ProfileStage::LinkFinish);
 #if CONFIG_DSHOT_TIMING_DIAGNOSTICS
     if (wait_us) *wait_us = esp_timer_get_time() - wait_started;
@@ -216,16 +245,6 @@ esp_err_t send_packet(RmtTransport& transport, std::uint16_t packet,
     }
     transport.in_flight = false;
     if (transport.bidirectional && error == ESP_OK) {
-        const auto rx_started = esp_timer_get_time();
-        profile_stage(profile, ProfileStage::RxWait);
-        const bool done = xSemaphoreTake(transport.rx_done, pdMS_TO_TICKS(2) + 1) == pdTRUE;
-        profile_stage(profile, ProfileStage::RxFinish);
-        transport.rx_timed_out = !done;
-        portENTER_CRITICAL(&transport.rx_lock);
-        transport.accept_rx = false;
-        const auto rx_error = transport.rx_error;
-        const auto count = transport.rx_count;
-        portEXIT_CRITICAL(&transport.rx_lock);
         if (!done || rx_error != ESP_OK) {
             retire_receive(transport);
             transport.reply.result = done ? ReplyResult::ReceiveError : ReplyResult::NoResponse;
@@ -241,10 +260,16 @@ esp_err_t send_packet(RmtTransport& transport, std::uint16_t packet,
             }
         }
         profile_stage(profile, ProfileStage::LinkFinish);
-        transport.rx_wait_us = esp_timer_get_time() - rx_started;
     }
     if (transport.bidirectional) gpio_ll_output_disable(&GPIO, transport.gpio);
     return error;
+}
+
+esp_err_t send_packet(RmtTransport& transport, std::uint16_t packet,
+                      std::uint64_t* wait_us, StageProfiler* profile) {
+    if (wait_us) *wait_us = 0;
+    const auto error = start_packet(transport, packet, profile);
+    return error == ESP_OK ? finish_packet(transport, wait_us, profile) : error;
 }
 
 esp_err_t close_transport(RmtTransport& transport) {

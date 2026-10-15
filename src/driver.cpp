@@ -235,15 +235,39 @@ esp_err_t Driver::set_stage_profiling(bool enabled) {
 
 esp_err_t Driver::send_once(std::uint64_t& wait_us, detail::StageProfiler* profile) {
     wait_us = 0;
+    struct Pending {
+        bool submitted = false;
+        esp_err_t error = ESP_OK;
+#if CONFIG_DSHOT_TIMING_DIAGNOSTICS
+        std::int64_t started_at_us = 0;
+#endif
+    };
+    std::array<Pending, kMaxLinks> pending{};
+    std::size_t prepared = 0;
+    esp_err_t batch_error = ESP_OK;
+    // Each transport owns its buffers until completion. Submit every active
+    // link before waiting so the RMT exchanges can overlap across motors.
     for (std::size_t i = 0; i < impl_->link_count; ++i) {
         if (impl_->stop_requested.load()) break;
-        std::uint64_t link_wait_us = 0;
 #if CONFIG_DSHOT_TIMING_DIAGNOSTICS
-        const auto started = esp_timer_get_time();
+        pending[i].started_at_us = esp_timer_get_time();
 #endif
-        bool transmitted = false;
+        pending[i].error = impl_->links[i]->start_pending(pending[i].submitted, profile);
+        prepared = i + 1;
+        if (pending[i].error != ESP_OK) {
+            batch_error = pending[i].error;
+            break;
+        }
+    }
+    // Drain every submitted exchange, even after stop or another link's error.
+    // No buffer, callback context, or channel may be retired while still active.
+    for (std::size_t i = 0; i < prepared; ++i) {
+        std::uint64_t link_wait_us = 0;
         std::uint64_t rx_wait_us = 0;
-        const auto error = impl_->links[i]->transmit_pending(&link_wait_us, transmitted, rx_wait_us, profile);
+        auto error = pending[i].error;
+        if (pending[i].submitted)
+            error = impl_->links[i]->finish_pending(&link_wait_us, rx_wait_us, profile);
+        const bool transmitted = pending[i].submitted && error == ESP_OK;
         detail::profile_stage(profile, ProfileStage::Bookkeeping);
 #if CONFIG_DSHOT_TIMING_DIAGNOSTICS
         const auto completed = esp_timer_get_time();
@@ -256,7 +280,7 @@ esp_err_t Driver::send_once(std::uint64_t& wait_us, detail::StageProfiler* profi
         else ++link.command_pauses;
 #if CONFIG_DSHOT_TIMING_DIAGNOSTICS
         if (transmitted || error != ESP_OK) {
-            record(link.outside_tx_wait, completed - started - link_wait_us);
+            record(link.outside_tx_wait, completed - pending[i].started_at_us - link_wait_us);
             record(link.tx_wait, link_wait_us);
             if (config_.signaling == Signaling::Bidirectional) record(link.rx_wait, rx_wait_us);
         }
@@ -268,9 +292,9 @@ esp_err_t Driver::send_once(std::uint64_t& wait_us, detail::StageProfiler* profi
         }
 #endif
         portEXIT_CRITICAL(&impl_->statistics_lock);
-        if (error != ESP_OK) return error;
+        if (batch_error == ESP_OK && error != ESP_OK) batch_error = error;
     }
-    return ESP_OK;
+    return batch_error;
 }
 
 void Driver::worker_entry(void* argument) {
