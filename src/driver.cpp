@@ -2,11 +2,13 @@
 #include "dshot/link.hpp"
 #include "config_validation.hpp"
 #include "frame_scheduler.hpp"
+#include "stage_profiler.hpp"
 
 #include <array>
 #include <atomic>
 #include <cstdlib>
 #include <new>
+#include <optional>
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -45,6 +47,9 @@ struct Driver::Impl {
     bool join_pending = false;
     std::atomic<bool> stop_requested{false};
     std::atomic<esp_err_t> last_error{ESP_OK};
+#if CONFIG_DSHOT_STAGE_PROFILING
+    std::atomic<bool> stage_profiling{false};
+#endif
     portMUX_TYPE statistics_lock = portMUX_INITIALIZER_UNLOCKED;
     DriverStatistics statistics;
     std::int64_t started_at_us = 0;
@@ -193,17 +198,42 @@ esp_err_t Driver::last_error() const {
 
 DriverStatistics Driver::statistics() const {
     DriverStatistics result;
-    result.detailed_timing = kDetailedTiming;
-    if (!impl_) return result;
-    portENTER_CRITICAL(&impl_->statistics_lock);
-    result = impl_->statistics;
-    result.detailed_timing = kDetailedTiming;
-    if (result.running) result.elapsed_us = esp_timer_get_time() - impl_->started_at_us;
-    portEXIT_CRITICAL(&impl_->statistics_lock);
+    statistics(result);
     return result;
 }
 
-esp_err_t Driver::send_once(std::uint64_t& wait_us) {
+void Driver::statistics(DriverStatistics& result) const {
+    if (impl_) {
+        portENTER_CRITICAL(&impl_->statistics_lock);
+        result = impl_->statistics;
+        if (result.running) result.elapsed_us = esp_timer_get_time() - impl_->started_at_us;
+        portEXIT_CRITICAL(&impl_->statistics_lock);
+    } else {
+        static const DriverStatistics empty;
+        result = empty;
+    }
+    result.detailed_timing = kDetailedTiming;
+#if CONFIG_DSHOT_STAGE_PROFILING
+    result.stage_profile.available = configNUMBER_OF_CORES == 1 || config_.task_core >= 0;
+    result.stage_profile.sample_interval = CONFIG_DSHOT_STAGE_PROFILE_INTERVAL;
+#endif
+}
+
+esp_err_t Driver::set_stage_profiling(bool enabled) {
+#if CONFIG_DSHOT_STAGE_PROFILING
+    if (enabled && configNUMBER_OF_CORES > 1 && config_.task_core < 0) return ESP_ERR_NOT_SUPPORTED;
+    if (!impl_ && enabled) {
+        impl_ = new (std::nothrow) Impl;
+        if (!impl_) return ESP_ERR_NO_MEM;
+    }
+    if (impl_) impl_->stage_profiling.store(enabled);
+    return ESP_OK;
+#else
+    return enabled ? ESP_ERR_NOT_SUPPORTED : ESP_OK;
+#endif
+}
+
+esp_err_t Driver::send_once(std::uint64_t& wait_us, detail::StageProfiler* profile) {
     wait_us = 0;
     for (std::size_t i = 0; i < impl_->link_count; ++i) {
         if (impl_->stop_requested.load()) break;
@@ -213,7 +243,8 @@ esp_err_t Driver::send_once(std::uint64_t& wait_us) {
 #endif
         bool transmitted = false;
         std::uint64_t rx_wait_us = 0;
-        const auto error = impl_->links[i]->transmit_pending(&link_wait_us, transmitted, rx_wait_us);
+        const auto error = impl_->links[i]->transmit_pending(&link_wait_us, transmitted, rx_wait_us, profile);
+        detail::profile_stage(profile, ProfileStage::Bookkeeping);
 #if CONFIG_DSHOT_TIMING_DIAGNOSTICS
         const auto completed = esp_timer_get_time();
 #endif
@@ -248,6 +279,9 @@ void Driver::worker_entry(void* argument) {
 }
 
 void Driver::worker_loop() {
+#if CONFIG_DSHOT_STAGE_PROFILING
+    unsigned profile_sequence = 0;
+#endif
     if (!impl_->stop_requested.load()) {
         const auto error = impl_->scheduler.start();
         if (error != ESP_OK) {
@@ -263,10 +297,20 @@ void Driver::worker_loop() {
         impl_->statistics.missed_slots += alarms - 1;
         portEXIT_CRITICAL(&impl_->statistics_lock);
         std::uint64_t wait_us = 0;
+#if CONFIG_DSHOT_STAGE_PROFILING
+        std::optional<detail::StageProfiler> sample;
+        if (impl_->stage_profiling.load() && ++profile_sequence % CONFIG_DSHOT_STAGE_PROFILE_INTERVAL == 0) {
+            sample.emplace(configNUMBER_OF_CORES == 1 ? 0 : config_.task_core);
+            sample->enter(ProfileStage::Bookkeeping); // Empty probe measures a timestamp pair's cost.
+        }
+        auto* profile = sample ? &*sample : nullptr;
+#else
+        detail::StageProfiler* profile = nullptr;
+#endif
 #if CONFIG_DSHOT_TIMING_DIAGNOSTICS
         const auto started = esp_timer_get_time();
 #endif
-        const auto error = send_once(wait_us);
+        const auto error = send_once(wait_us, profile);
 #if CONFIG_DSHOT_TIMING_DIAGNOSTICS
         const auto elapsed = esp_timer_get_time() - started;
 #endif
@@ -277,6 +321,21 @@ void Driver::worker_loop() {
         record(impl_->statistics.outside_tx_wait, elapsed - wait_us);
 #endif
         portEXIT_CRITICAL(&impl_->statistics_lock);
+#if CONFIG_DSHOT_STAGE_PROFILING
+        if (sample) {
+            sample->finish();
+            portENTER_CRITICAL(&impl_->statistics_lock);
+            auto& totals = impl_->statistics.stage_profile;
+            ++totals.sampled_passes;
+            totals.idle_clamps += sample->result.idle_clamps;
+            for (std::size_t i = 0; i < totals.stages.size(); ++i) {
+                totals.stages[i].count += sample->result.stages[i].count;
+                totals.stages[i].elapsed_us += sample->result.stages[i].elapsed_us;
+                totals.stages[i].busy_us += sample->result.stages[i].busy_us;
+            }
+            portEXIT_CRITICAL(&impl_->statistics_lock);
+        }
+#endif
         if (error != ESP_OK) {
             impl_->last_error.store(error);
             ESP_LOGE(kTag, "TX failed: %s", esp_err_to_name(error));

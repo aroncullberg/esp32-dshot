@@ -11,6 +11,7 @@
 #include "telemetry_codec.hpp"
 
 namespace dshot::detail {
+class StageProfiler;
 inline constexpr std::uint32_t kRMTResolutionHz = 40'000'000;
 
 struct RmtTransport {
@@ -48,7 +49,7 @@ struct RmtTransport {
 
 esp_err_t open_transport(RmtTransport& transport, gpio_num_t gpio, const Config& config);
 esp_err_t send_packet(RmtTransport& transport, std::uint16_t packet,
-                      std::uint64_t* wait_us = nullptr);
+                      std::uint64_t* wait_us = nullptr, StageProfiler* profile = nullptr);
 esp_err_t close_transport(RmtTransport& transport);
 // Failed cleanup may leave callbacks pointing into the transport.
 void close_transport_or_abort(RmtTransport& transport);

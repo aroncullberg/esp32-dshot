@@ -10,3 +10,5 @@ idf_component_register(
     REQUIRES ${DSHOT_COMPONENT_NAME} console esp_timer esp_driver_gpio freertos
 )
 target_compile_definitions(${COMPONENT_LIB} PRIVATE DSHOT_BENCH_FOUR_MOTORS=1)
+# Catch large local state/return-value temporaries before they exhaust the bench stack.
+target_compile_options(${COMPONENT_LIB} PRIVATE -Werror=frame-larger-than=2048)

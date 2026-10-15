@@ -7,6 +7,7 @@
 #include "esp_err.h"
 
 namespace dshot {
+namespace detail { class StageProfiler; }
 class Driver;
 
 class Link {
@@ -25,6 +26,7 @@ public:
     // EDT requests require bidirectional signaling and a zero payload (like command, since its a command)
     esp_err_t request_edt(bool enabled);
     Telemetry telemetry() const;
+    TelemetryCounters telemetry_counters() const;
     ReceiveCapture receive_capture() const;
 
     Link(const Link&) = delete;
@@ -36,7 +38,8 @@ private:
     friend class Driver;
     friend class Passthrough;
     bool ready() const;
-    esp_err_t transmit_pending(std::uint64_t* wait_us, bool& transmitted, std::uint64_t& rx_wait_us);
+    esp_err_t transmit_pending(std::uint64_t* wait_us, bool& transmitted, std::uint64_t& rx_wait_us,
+                              detail::StageProfiler* profile = nullptr);
     void cancel_pending_command();
 
     struct Impl;

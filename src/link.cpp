@@ -3,6 +3,7 @@
 #include "idf_transport.hpp"
 #include "command_sequence.hpp"
 #include "telemetry_state.hpp"
+#include "stage_profiler.hpp"
 
 #include <new>
 #include "freertos/FreeRTOS.h"
@@ -98,6 +99,14 @@ esp_err_t Link::request_edt(bool enabled) {
     return send_command(enabled ? Command::ExtendedTelemetryEnable : Command::ExtendedTelemetryDisable);
 }
 
+TelemetryCounters Link::telemetry_counters() const {
+    if (!impl_) return closed_telemetry_.counters;
+    portENTER_CRITICAL(&impl_->pending_lock);
+    const auto counters = impl_->telemetry.data.counters;
+    portEXIT_CRITICAL(&impl_->pending_lock);
+    return counters;
+}
+
 Telemetry Link::telemetry() const {
     detail::TelemetryState snapshot;
     if (!impl_) snapshot.data = closed_telemetry_;
@@ -133,7 +142,9 @@ void Link::cancel_pending_command() {
     portEXIT_CRITICAL(&impl_->pending_lock);
 }
 
-esp_err_t Link::transmit_pending(std::uint64_t* wait_us, bool& transmitted, std::uint64_t& rx_wait_us) {
+esp_err_t Link::transmit_pending(std::uint64_t* wait_us, bool& transmitted, std::uint64_t& rx_wait_us,
+                                 detail::StageProfiler* profile) {
+    detail::profile_stage(profile, ProfileStage::FramePrepare);
     transmitted = false;
     rx_wait_us = 0;
     if (!ready()) return ESP_ERR_INVALID_STATE;
@@ -159,7 +170,8 @@ esp_err_t Link::transmit_pending(std::uint64_t* wait_us, bool& transmitted, std:
     const auto body = frame.body;
     std::uint16_t packet;
     auto error = detail::encode_regular_packet(body >> 1, (body & 1) != 0, packet);
-    if (error == ESP_OK) error = detail::send_packet(impl_->transport, packet, wait_us);
+    if (error == ESP_OK) error = detail::send_packet(impl_->transport, packet, wait_us, profile);
+    detail::profile_stage(profile, ProfileStage::TelemetryUpdate);
     transmitted = error == ESP_OK;
     if (frame.id != 0 || impl_->transport.bidirectional) {
         const auto now = esp_timer_get_time();
@@ -180,6 +192,7 @@ esp_err_t Link::transmit_pending(std::uint64_t* wait_us, bool& transmitted, std:
             // Lifecycle calls serialize changes to opened.
             if (transport.rx_count && transport.reply.result != detail::ReplyResult::NoResponse &&
                 transport.reply.result != detail::ReplyResult::ReceiveError) {
+                detail::profile_stage(profile, ProfileStage::CaptureCopy);
                 auto& capture = impl_->capture;
                 capture.captured_at_us = now;
                 capture.resolution_hz = detail::kRMTResolutionHz;
@@ -194,6 +207,7 @@ esp_err_t Link::transmit_pending(std::uint64_t* wait_us, bool& transmitted, std:
                 }
             }
         }
+        detail::profile_stage(profile, ProfileStage::LinkFinish);
         portEXIT_CRITICAL(&impl_->pending_lock);
     }
     rx_wait_us = impl_->transport.rx_wait_us;

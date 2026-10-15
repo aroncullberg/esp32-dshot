@@ -5,3 +5,5 @@ idf_component_register(
     INCLUDE_DIRS "."
     REQUIRES ${DSHOT_COMPONENT_NAME} console esp_timer esp_driver_gpio freertos
 )
+# Reporting must leave headroom for nested ESP-IDF and libc calls on the 8 KiB task stack.
+target_compile_options(${COMPONENT_LIB} PRIVATE -Werror=frame-larger-than=2048)

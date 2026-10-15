@@ -1,0 +1,60 @@
+profile
+Sampling profile for 3 seconds; keep the workload unchanged...
+dshot> profile: 3.010 s | D600 regular | target 1000 Hz | worker core 1
+  stream stopped | detailed timing off | snapshot overhead 332/257 us
+  active outputs: none
+CPU0: 0.2% busy
+CPU1: 0.0% busy
+CPU average: 0.1% busy
+Task runtime: 100% = one core; idle tasks included
+  task               runtime us     CPU %
+  dshot_bench              5446     0.18%
+  IDLE1                 3009773   100.01%
+  IDLE0                 3004951    99.85%
+  console_repl              227     0.01%
+  ipc0                        0     0.00%
+  ipc1                        0     0.00%
+  RTOS task accounting includes interrupt time in the interrupted task; ISR cost is not separated.
+DShot window: passes 0 (0.0/s) | missed slots 0
+arm
+dshot> arming
+
+dshot> motor all
+dshot> selected motors: 1 2 3 4
+arm
+arming
+dshot> armed
+
+dshot> 
+dshot> 
+dshot> profile
+Sampling profile for 3 seconds; keep the workload unchanged...
+dshot> profile: 3.010 s | D600 regular | target 1000 Hz | worker core 1
+  stream running | detailed timing off | snapshot overhead 559/379 us
+  active outputs: 1(raw 0) 2(raw 0) 3(raw 0) 4(raw 0)
+CPU0: 0.2% busy
+CPU1: 15.4% busy
+CPU average: 7.8% busy
+Task runtime: 100% = one core; idle tasks included
+  task               runtime us     CPU %
+  dshot_bench              6809     0.23%
+  IDLE1                 2545229    84.57%
+  IDLE0                 3003943    99.81%
+  console_repl              634     0.02%
+  dshot_tx               464033    15.42%
+  ipc0                        0     0.00%
+  ipc1                        0     0.00%
+  RTOS task accounting includes interrupt time in the interrupted task; ISR cost is not separated.
+DShot window: passes 3009 (999.8/s) | missed slots 0
+  GPIO 18: frames 3010 (1000.1/s) | TX errors 0 | command pauses 0
+  GPIO 39: frames 3010 (1000.1/s) | TX errors 0 | command pauses 0
+  GPIO 38: frames 3010 (1000.1/s) | TX errors 0 | command pauses 0
+  GPIO 40: frames 3009 (999.8/s) | TX errors 0 | command pauses 0
+
+dshot> 
+
+
+
+
+
+

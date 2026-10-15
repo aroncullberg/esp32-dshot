@@ -89,6 +89,10 @@ void test_startup_low_hold() {
 void test_lifecycle() {
     Driver driver(config());
     assert(!driver.statistics().running && driver.statistics().elapsed_us == 0);
+    DriverStatistics destination;
+    destination.elapsed_us = 123;
+    driver.statistics(destination);
+    assert(!destination.running && destination.elapsed_us == 0 && destination.link_count == 0);
     Link link(driver,GPIO_NUM_2);
     Link duplicate(driver,GPIO_NUM_2);
     assert(driver.start() == ESP_ERR_INVALID_STATE);
@@ -642,6 +646,7 @@ void test_silent_bidirectional_group() {
             assert(telemetry.counters.no_response == pass);
             assert(telemetry.counters.empty_captures == pass && telemetry.counters.rx_timeouts == 0);
             assert(telemetry.counters.replies == 0);
+            assert(link->telemetry_counters().no_response == telemetry.counters.no_response);
             assert(telemetry.speed.state == ErpmState::NoData);
         }
     }
@@ -660,6 +665,59 @@ void test_silent_bidirectional_group() {
     std::puts("PASS: all silent outputs complete without RX timeouts and accept replies on the next pass");
 }
 
+void test_stage_profiling() {
+#if CONFIG_DSHOT_STAGE_PROFILING
+    manual_timer = true;
+    for (const auto signaling : {Signaling::Regular, Signaling::Bidirectional}) {
+        auto c = config();
+        c.task_core = 0;
+        c.signaling = signaling;
+        Driver driver(c);
+        Link link(driver, GPIO_NUM_2);
+        assert(link.begin() == ESP_OK && driver.start() == ESP_OK);
+        eventually([] { return active_timer.load() && tasks.back()->waiting.load(); });
+        assert(driver.set_stage_profiling(true) == ESP_OK);
+        auto advance = [&]() {
+            for (unsigned i = 0; i < CONFIG_DSHOT_STAGE_PROFILE_INTERVAL; ++i) {
+                const auto pass = driver.statistics().worker_iterations;
+                emit_alarm(active_timer.load());
+                eventually([&] { return driver.statistics().worker_iterations > pass && tasks.back()->waiting.load(); });
+            }
+        };
+        advance();
+        const auto stats = driver.statistics().stage_profile;
+        assert(stats.available && stats.sampled_passes == 1);
+        assert(stats.stages[static_cast<std::size_t>(ProfileStage::TxSubmit)].count == 1);
+        assert(stats.stages[static_cast<std::size_t>(ProfileStage::TxWait)].count == 1);
+        const auto rx = signaling == Signaling::Bidirectional ? 1u : 0u;
+        assert(stats.stages[static_cast<std::size_t>(ProfileStage::RxSetup)].count == rx);
+        assert(stats.stages[static_cast<std::size_t>(ProfileStage::RxWait)].count == rx);
+        assert(stats.stages[static_cast<std::size_t>(ProfileStage::EchoStrip)].count == rx);
+        assert(stats.stages[static_cast<std::size_t>(ProfileStage::ReplyDecode)].count == rx);
+        assert(stats.stages[static_cast<std::size_t>(ProfileStage::CaptureCopy)].count == rx);
+        assert(driver.set_stage_profiling(false) == ESP_OK);
+        advance();
+        assert(driver.statistics().stage_profile.sampled_passes == 1);
+        driver.stop();
+        assert(driver.start() == ESP_OK);
+        assert(driver.statistics().stage_profile.sampled_passes == 0);
+        link.end();
+        clean();
+    }
+    if (configNUMBER_OF_CORES > 1) {
+        Driver unpinned(config());
+        assert(unpinned.set_stage_profiling(true) == ESP_ERR_NOT_SUPPORTED);
+        assert(!unpinned.statistics().stage_profile.available);
+    }
+    manual_timer = false;
+    std::puts("PASS: stage sample interval, regular/bidirectional scopes, runtime gating, reset and worker affinity");
+#else
+    Driver driver(config());
+    assert(driver.set_stage_profiling(true) == ESP_ERR_NOT_SUPPORTED);
+    assert(driver.set_stage_profiling(false) == ESP_OK);
+#endif
+}
+
 int main() {
     test_config_and_transport(); std::puts("PASS: configuration, partial setup rollback, timeout abort and close");
     test_startup_low_hold();
@@ -670,6 +728,7 @@ int main() {
     test_bidirectional_transport();
     test_silent_bidirectional_group();
     test_edt_link();
+    test_stage_profiling();
     std::puts("PASS: command packets, completed repetitions, quiet gaps, cancellation, cooldowns and faults");
     clean();
 }

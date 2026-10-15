@@ -1,0 +1,218 @@
+Wrote 262144 bytes (155211 compressed) at 0x00015000 in 3.2 seconds (647.2 kbit/s).
+Hash of data verified.
+
+Hard resetting via RTS pin...
+Executing action: monitor
+Running idf_monitor in directory /Users/aron/code/esp32-dshot/examples/bench4
+Executing "/Users/aron/.espressif/python_env/idf6.1_py3.14_env/bin/python /Users/aron/esp/esp-idf-v6.1/tools/idf_monitor.py -p /dev/cu.usbmodem3142201 -b 115200 --toolchain-prefix xtensa-esp32s3-elf- --target esp32s3 --revision 0 /Users/aron/code/esp32-dshot/examples/bench4/build/dshot_bench4.elf /Users/aron/code/esp32-dshot/examples/bench4/build/bootloader/bootloader.elf -m '/Users/aron/.espressif/python_env/idf6.1_py3.14_env/bin/python' '/Users/aron/esp/esp-idf-v6.1/tools/idf.py'"...
+--- esp-idf-monitor 1.10.0 on /dev/cu.usbmodem3142201 115200
+--- Quit: Ctrl+] | Menu: Ctrl+T | Help: Ctrl+T followed by Ctrl+H
+W (105) spi_flash: Detected size(16384k) larger than the size inESP-ROM:esp32s3-20210327
+Build:Mar 27 2021
+rst:0x15 (USB_UART_CHIP_RESET),boot:0x8 (SPI_FAST_FLASH_BOOT)
+Saved PC:0x4037af46
+--- 0x4037af46: esp_cpu_wait_for_intr at /Users/aron/esp/esp-idf-v6.1/components/esp_hw_support/cpu.c:64
+SPIWP:0xee
+mode:DIO, clock div:1
+load:0x3fce2820,len:0x1548
+load:0x403c8700,len:0xdac
+--- 0x403c8700: _stext at ??:?
+load:0x403cb700,len:0x2f60
+entry 0x403c8900
+--- 0x403c8900: call_start_cpu0 at /Users/aron/esp/esp-idf-v6.1/components/bootloader/subproject/main/bootloader_start.c:27
+I (24) boot: ESP-IDF v6.1-1-g048d2ec12de 2nd stage bootloader
+I (24) boot: compile time Oct 15 2026 14:00:27
+I (25) boot: Multicore bootloader
+I (25) boot: chip revision: v0.2
+I (25) boot: efuse block revision: v1.3
+I (25) boot.esp32s3: Boot SPI Speed : 80MHz
+I (25) boot.esp32s3: SPI Mode       : DIO
+I (26) boot.esp32s3: SPI Flash Size : 2MB
+I (26) boot: Enabling RNG early entropy source...
+I (26) boot: Partition Table:
+I (26) boot: ## Label            Usage          Type ST Offset   Length
+I (26) boot:  0 nvs              WiFi data        01 02 00009000 00006000
+I (27) boot:  1 phy_init         RF data          01 01 0000f000 00001000
+I (27) boot:  2 factory          factory app      00 00 00010000 00100000
+I (28) boot: End of partition table
+I (28) esp_image: segment 0: paddr=00010020 vaddr=3c030020 size=0e7b8h ( 59320) map
+I (39) esp_image: segment 1: paddr=0001e7e0 vaddr=3fc93400 size=01838h (  6200) load
+I (41) esp_image: segment 2: paddr=00020020 vaddr=42000020 size=233d0h (144336) map
+I (68) esp_image: segment 3: paddr=000433f8 vaddr=3fc94c38 size=01cdch (  7388) load
+I (70) esp_image: segment 4: paddr=000450dc vaddr=40374000 size=0f378h ( 62328) load
+I (84) esp_image: segment 5: paddr=0005445c vaddr=50000000 size=00024h (    36) load
+I (91) boot: Loaded app from partition at offset 0x10000
+I (91) boot: Disabling RNG early entropy source...
+I (92) cpu_start: Multicore app
+I (101) cpu_start: Pro cpu start user code
+I (101) cpu_start: cpu freq: 240000000 Hz
+I (102) app_init: Application information:
+I (102) app_init: Project name:     dshot_bench4
+I (102) app_init: App version:      b655c3a-dirty
+I (102) app_init: Compile time:     Oct 15 2026 14:41:15
+I (102) app_init: ELF file SHA256:  5d9f56485...
+I (102) app_init: ESP-IDF:          v6.1-1-g048d2ec12de
+I (102) efuse_init: Min chip rev:     v0.0
+I (103) efuse_init: Max chip rev:     v0.99 
+I (103) efuse_init: Chip rev:         v0.2
+I (103) heap_init: Initializing. RAM available for dynamic allocation:
+I (103) heap_init: At 3FC97400 len 00052310 (328 KiB): RAM
+I (103) heap_init: At 3FCE9710 len 00005724 (21 KiB): RAM
+I (103) heap_init: At 3FCF0000 len 00008000 (32 KiB): DRAM
+I (104) heap_init: At 600FE000 len 00001FE8 (7 KiB): RTCRAM
+I (105) spi_flash: detected chip: boya
+I (105) spi_flash: flash io: dio
+W (105) spi_flash: Detected size(16384k) larger than the size in the binary image header(2048k). Using the size in the binary image header.
+I (106) sleep_gpio: Configure to isolate all GPIO pins in sleep state
+I (106) sleep_gpio: Enable automatic switching of GPIO sleep configuration
+I (107) main_task: Started on CPU0
+I (108) main_task: Calling app_main()
+Motor 1: GPIO 18
+Motor 2: GPIO 39
+Motor 3: GPIO 38
+Motor 4: GPIO 40
+DShot600 | target 1000 Hz per motor | FreeRTOS 1000 Hz | RX timeout 3 ticks
+Startup low hold: 300 ms per output
+All motors selected. motor 1..4 selects one; motor all selects all.
+Bidirectional (inverted)
+RX starts before TX; outgoing echo removed
+
+Type 'help' to get the list of commands.
+Use UP/DOWN arrows to navigate through command history.
+Press TAB when typing command name to auto-complete.
+
+Your terminal application does not support escape sequences.
+
+Line editing and history features are disabled.
+
+On Windows, try using Windows Terminal or Putty instead.
+dshot> [0nI (668) main_task: Returned from app_main()
+
+Unrecognized command
+dshot> profile 5 basic
+Sampling profile for 5 seconds; keep the workload unchanged...
+dshot> profile: 5.010 s | D600 bidirectional | target 1000 Hz | worker core 1
+  stream stopped | detailed timing off | snapshot overhead 353/242 us
+  active outputs: none
+CPU0: 0.1% busy
+CPU1: 0.0% busy
+CPU average: 0.1% busy
+Task runtime: 100% = one core; idle tasks included
+  task               runtime us     CPU %
+  dshot_bench              8369     0.17%
+  IDLE1                 5008883    99.98%
+  IDLE0                 5002443    99.85%
+  console_repl              467     0.01%
+  ipc0                        0     0.00%
+  ipc1                        0     0.00%
+  RTOS task accounting includes interrupt time in the interrupted task; ISR cost is not separated.
+DShot window: passes 0 (0.0/s) | missed slots 0
+Stage profile: off (basic sample, not compiled, or worker not pinned)
+profile 5 
+Sampling profile for 5 seconds; keep the workload unchanged...
+dshot> profile: 5.010 s | D600 bidirectional | target 1000 Hz | worker core 1
+  stream stopped | detailed timing off | snapshot overhead 362/236 us
+  active outputs: none
+CPU0: 0.1% busy
+CPU1: 0.0% busy
+CPU average: 0.1% busy
+Task runtime: 100% = one core; idle tasks included
+  task               runtime us     CPU %
+  dshot_bench              8372     0.17%
+  IDLE1                 5008772    99.98%
+  IDLE0                 5002288    99.85%
+  console_repl              472     0.01%
+  ipc0                        0     0.00%
+  ipc1                        0     0.00%
+  RTOS task accounting includes interrupt time in the interrupted task; ISR cost is not separated.
+DShot window: passes 0 (0.0/s) | missed slots 0
+Stage profile: 0 sampled updates / 0 | interval 1/16 | idle clamps 0
+  No stage samples (worker stopped or sample interval not reached).
+motor all
+selected motors: 1 2 3 4
+dshot> arm
+dshot> arming
+armed
+profile 5 basic
+Sampling profile for 5 seconds; keep the workload unchanged...
+dshot> profile: 5.010 s | D600 bidirectional | target 1000 Hz | worker core 1
+  stream running | detailed timing off | snapshot overhead 565/386 us
+  active outputs: 1(raw 0) 2(raw 0) 3(raw 0) 4(raw 0)
+CPU0: 0.2% busy
+CPU1: 38.8% busy
+CPU average: 19.5% busy
+Task runtime: 100% = one core; idle tasks included
+  task               runtime us     CPU %
+  dshot_bench              9108     0.18%
+  IDLE1                 3065906    61.19%
+  IDLE0                 5002163    99.84%
+  console_repl              803     0.02%
+  dshot_tx              1943789    38.80%
+  ipc0                        0     0.00%
+  ipc1                        0     0.00%
+  RTOS task accounting includes interrupt time in the interrupted task; ISR cost is not separated.
+DShot window: passes 5009 (999.8/s) | missed slots 1
+  GPIO 18: frames 5009 (999.8/s) | TX errors 0 | command pauses 0
+  GPIO 39: frames 5009 (999.8/s) | TX errors 0 | command pauses 0
+  GPIO 38: frames 5009 (999.8/s) | TX errors 0 | command pauses 0
+  GPIO 40: frames 5009 (999.8/s) | TX errors 0 | command pauses 0
+Stage profile: off (basic sample, not compiled, or worker not pinned)
+  Motor 1 RX: replies 5008 | no response 0 (timeouts 0, empty/idle 0)
+    malformed 1 | GCR 0 | CRC 0 | overflow 0 | errors 0
+  Motor 2 RX: replies 5009 | no response 0 (timeouts 0, empty/idle 0)
+    malformed 0 | GCR 0 | CRC 0 | overflow 0 | errors 0
+  Motor 3 RX: replies 5009 | no response 0 (timeouts 0, empty/idle 0)
+    malformed 0 | GCR 0 | CRC 0 | overflow 0 | errors 0
+  Motor 4 RX: replies 5009 | no response 0 (timeouts 0, empty/idle 0)
+    malformed 0 | GCR 0 | CRC 0 | overflow 0 | errors 0
+profile 5
+Sampling profile for 5 seconds; keep the workload unchanged...
+dshot> profile: 5.010 s | D600 bidirectional | target 1000 Hz | worker core 1
+  stream running | detailed timing off | snapshot overhead 575/395 us
+  active outputs: 1(raw 0) 2(raw 0) 3(raw 0) 4(raw 0)
+CPU0: 0.2% busy
+CPU1: 39.9% busy
+CPU average: 20.1% busy
+Task runtime: 100% = one core; idle tasks included
+  task               runtime us     CPU %
+  dshot_bench             10562     0.21%
+  IDLE1                 3009521    60.07%
+  IDLE0                 5001281    99.83%
+  console_repl              725     0.01%
+  dshot_tx              1999392    39.91%
+  ipc0                        0     0.00%
+  ipc1                        0     0.00%
+  RTOS task accounting includes interrupt time in the interrupted task; ISR cost is not separated.
+DShot window: passes 5009 (999.8/s) | missed slots 1
+  GPIO 18: frames 5009 (999.8/s) | TX errors 0 | command pauses 0
+  GPIO 39: frames 5009 (999.8/s) | TX errors 0 | command pauses 0
+  GPIO 38: frames 5009 (999.8/s) | TX errors 0 | command pauses 0
+  GPIO 40: frames 5009 (999.8/s) | TX errors 0 | command pauses 0
+Stage profile: 313 sampled updates / 5009 | interval 1/16 | idle clamps 0
+  stage                 visits  elapsed us/v     busy us/v  est core %
+  empty probe              313          1.01          1.01       0.10%
+  frame preparation       1252          4.27          4.27       1.71%
+  symbol encoding         1252          7.51          7.51       3.00%
+  RX setup                1252          8.43          8.43       3.37%
+  TX submission           1252         16.39         16.39       6.55%
+  TX wait                 1252         42.68         17.48       6.99%
+  RX wait                 1252         88.20         13.89       5.55%
+  RX finish               1252          2.87          2.87       1.15%
+  echo removal            1252         18.18         18.18       7.27%
+  reply decoding          1252         18.70         18.70       7.48%
+  telemetry update        1252          5.04          5.04       2.02%
+  raw capture copy        1252          3.49          3.49       1.40%
+  link finish             3756          2.90          2.90       3.48%
+  bookkeeping             1565          4.31          4.31       2.16%
+  Elapsed includes blocking; busy subtracts core idle and can include other tasks.
+  Core % extrapolates sampled updates; probe/measurement overhead and sampling bias apply.
+  Scheduler work outside the sampled pass, aggregate merging, and separate ISR costs are not covered.
+  Motor 1 RX: replies 5009 | no response 0 (timeouts 0, empty/idle 0)
+    malformed 0 | GCR 0 | CRC 0 | overflow 0 | errors 0
+  Motor 2 RX: replies 5009 | no response 0 (timeouts 0, empty/idle 0)
+    malformed 0 | GCR 0 | CRC 0 | overflow 0 | errors 0
+  Motor 3 RX: replies 5009 | no response 0 (timeouts 0, empty/idle 0)
+    malformed 0 | GCR 0 | CRC 0 | overflow 0 | errors 0
+  Motor 4 RX: replies 5009 | no response 0 (timeouts 0, empty/idle 0)
+    malformed 0 | GCR 0 | CRC 0 | overflow 0 | errors 0
+

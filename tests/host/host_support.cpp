@@ -125,6 +125,12 @@ void vTaskDelay(TickType_t ticks) {
     startup_delay_ticks = ticks;
 }
 TaskHandle_t xTaskGetCurrentTaskHandle() { return current_task; }
+#if CONFIG_DSHOT_STAGE_PROFILING
+configRUN_TIME_COUNTER_TYPE ulTaskGetIdleRunTimeCounterForCore(BaseType_t core) {
+    assert(core >= 0 && core < configNUMBER_OF_CORES);
+    return 0; // Arithmetic/blocked-time accounting is exercised by stage_profiler_test.
+}
+#endif
 BaseType_t xTaskNotifyGive(TaskHandle_t handle) {
     auto& task = *static_cast<HostTask*>(handle);
     std::lock_guard lock(task.mutex);

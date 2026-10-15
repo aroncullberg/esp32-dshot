@@ -56,6 +56,7 @@ def run_suite(name, sources, compiler, build, includes, diagnostics=0, defines=(
         (Path(temporary) / "sdkconfig.h").write_text(
             f'#include "{build / "config/sdkconfig.h"}"\n'
             '#undef CONFIG_DSHOT_TIMING_DIAGNOSTICS\n'
+            '#undef CONFIG_DSHOT_STAGE_PROFILING\n#define CONFIG_DSHOT_STAGE_PROFILING 0\n'
             '#undef CONFIG_FREERTOS_HZ\n#define CONFIG_FREERTOS_HZ 100\n'
             '#ifndef CONFIG_DSHOT_DEFAULT_STARTUP_LOW_MS\n#define CONFIG_DSHOT_DEFAULT_STARTUP_LOW_MS 0\n#endif\n'
             f'#define CONFIG_DSHOT_TIMING_DIAGNOSTICS {diagnostics}\n' +
@@ -83,14 +84,41 @@ def main():
         compiler = shlex.split(os.environ.get("CXX", "clang++"))
         if not compiler or shutil.which(compiler[0]) is None:
             raise ValueError("Host C++ compiler not found. Install clang++ or set CXX to a host compiler with ASan/UBSan support.")
+        run_suite("telemetry_codec_test", [HOST / "telemetry_codec_test.cpp", ROOT / "src/telemetry_codec.cpp"],
+                  compiler, build, includes)
         run_suite("unit_test", UNIT_SOURCES, compiler, build, includes)
         for diagnostics in (0, 1):
             run_suite(f"driver_integration_test_{diagnostics}", INTEGRATION_SOURCES,
                       compiler, build, includes, diagnostics)
+        stage_defines = ("CONFIG_DSHOT_STAGE_PROFILING=1", "CONFIG_DSHOT_STAGE_PROFILE_INTERVAL=16",
+                         "CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=1",
+                         "CONFIG_FREERTOS_RUN_TIME_STATS_USING_ESP_TIMER=1",
+                         "CONFIG_FREERTOS_RUN_TIME_COUNTER_TYPE_U64=1")
+        run_suite("driver_stage_profile_test", INTEGRATION_SOURCES, compiler, build, includes,
+                  defines=stage_defines)
         run_suite("bench_console_test", BENCH_SOURCES, compiler, build, includes)
         run_suite("bench4_console_test", BENCH_SOURCES, compiler, build, includes,
                   defines=("DSHOT_BENCH_FOUR_MOTORS=1", "CONFIG_DSHOT_BENCH_GPIO_2=3",
-                           "CONFIG_DSHOT_BENCH_GPIO_3=4", "CONFIG_DSHOT_BENCH_GPIO_4=5"))
+                           "CONFIG_DSHOT_BENCH_GPIO_3=4", "CONFIG_DSHOT_BENCH_GPIO_4=5",
+                           "CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=0"))
+        for counter64 in (0, 1):
+            stage_test_defines = (*stage_defines[:-1], f"CONFIG_FREERTOS_RUN_TIME_COUNTER_TYPE_U64={counter64}")
+            run_suite(f"stage_profiler_test_u{64 if counter64 else 32}", [HOST / "stage_profiler_test.cpp"],
+                      compiler, build, includes, defines=stage_test_defines)
+            run_suite(f"bench4_cpu_test_u{64 if counter64 else 32}", BENCH_SOURCES,
+                      compiler, build, includes,
+                      defines=("DSHOT_BENCH_FOUR_MOTORS=1", "CONFIG_DSHOT_BENCH_GPIO_2=3",
+                               "CONFIG_DSHOT_BENCH_GPIO_3=4", "CONFIG_DSHOT_BENCH_GPIO_4=5",
+                               "CONFIG_FREERTOS_NUMBER_OF_CORES=2",
+                               "CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=1",
+                               "CONFIG_FREERTOS_RUN_TIME_STATS_USING_ESP_TIMER=1",
+                               "CONFIG_DSHOT_STAGE_PROFILING=1", "CONFIG_DSHOT_STAGE_PROFILE_INTERVAL=16",
+                               "CONFIG_DSHOT_DEFAULT_TASK_CORE=1",
+                               f"CONFIG_FREERTOS_RUN_TIME_COUNTER_TYPE_U64={counter64}"))
+        run_suite("bench4_stage_disabled_test", BENCH_SOURCES, compiler, build, includes,
+                  defines=(*stage_defines, "CONFIG_DSHOT_STAGE_PROFILING=0", "DSHOT_BENCH_FOUR_MOTORS=1",
+                           "CONFIG_DSHOT_BENCH_GPIO_2=3", "CONFIG_DSHOT_BENCH_GPIO_3=4",
+                           "CONFIG_DSHOT_BENCH_GPIO_4=5", "CONFIG_FREERTOS_NUMBER_OF_CORES=2"))
     except (OSError, ValueError, KeyError) as error:
         parser.exit(1, f"error: {error}\n")
     except subprocess.CalledProcessError as error:

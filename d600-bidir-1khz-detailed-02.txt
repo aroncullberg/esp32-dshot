@@ -1,0 +1,136 @@
+dshot> 
+dshot> profile 5 basic
+Sampling profile for 5 seconds; keep the workload unchanged...
+dshot> profile: 5.010 s | D600 bidirectional | target 1000 Hz | worker core 1
+  stream stopped | detailed timing off | snapshot overhead 529/387 us
+  active outputs: none
+CPU0: 0.1% busy
+CPU1: 0.0% busy
+CPU average: 0.1% busy
+Task runtime: 100% = one core; idle tasks included
+  task               runtime us     CPU % stack free B
+  dshot_bench              8022     0.16%         6228
+  IDLE1                 5008764    99.98%          908
+  IDLE0                 5002801    99.86%          908
+  console_repl              604     0.01%         2820
+  ipc0                        0     0.00%          616
+  ipc1                        0     0.00%          616
+  RTOS task accounting includes interrupt time in the interrupted task; ISR cost is not separated.
+DShot window: passes 0 (0.0/s) | missed slots 0
+Stage profile: off (basic sample, not compiled, or worker not pinned)
+Bench stack minimum free after reporting: 6004 bytes
+
+dshot> profile 5
+Sampling profile for 5 seconds; keep the workload unchanged...
+dshot> profile: 5.010 s | D600 bidirectional | target 1000 Hz | worker core 1
+  stream stopped | detailed timing off | snapshot overhead 482/374 us
+  active outputs: none
+CPU0: 0.1% busy
+CPU1: 0.0% busy
+CPU average: 0.1% busy
+Task runtime: 100% = one core; idle tasks included
+  task               runtime us     CPU % stack free B
+  dshot_bench              7954     0.16%         6004
+  IDLE1                 5009009    99.98%          796
+  IDLE0                 5003030    99.86%          908
+  console_repl              587     0.01%         2820
+  ipc0                        0     0.00%          616
+  ipc1                        0     0.00%          616
+  RTOS task accounting includes interrupt time in the interrupted task; ISR cost is not separated.
+DShot window: passes 0 (0.0/s) | missed slots 0
+Stage profile: 0 sampled updates / 0 | interval 1/16 | idle clamps 0
+  No stage samples (worker stopped or sample interval not reached).
+Bench stack minimum free after reporting: 5828 bytes
+
+dshot> motor all
+selected motors: 1 2 3 4
+dshot> arm
+dshot> arming
+armed
+
+dshot> profile 5 basic
+Sampling profile for 5 seconds; keep the workload unchanged...
+dshot> profile: 5.010 s | D600 bidirectional | target 1000 Hz | worker core 1
+  stream running | detailed timing off | snapshot overhead 628/508 us
+  active outputs: 1(raw 0) 2(raw 0) 3(raw 0) 4(raw 0)
+CPU0: 0.1% busy
+CPU1: 33.9% busy
+CPU average: 17.0% busy
+Task runtime: 100% = one core; idle tasks included
+  task               runtime us     CPU % stack free B
+  dshot_bench              8639     0.17%         5828
+  IDLE1                 3311960    66.11%          796
+  IDLE0                 5002378    99.86%          796
+  dshot_tx              1697124    33.88%         2456
+  console_repl              765     0.02%         2820
+  ipc0                        0     0.00%          616
+  ipc1                        0     0.00%          616
+  RTOS task accounting includes interrupt time in the interrupted task; ISR cost is not separated.
+DShot window: passes 5009 (999.9/s) | missed slots 0
+  GPIO 18: frames 5009 (999.9/s) | TX errors 0 | command pauses 0
+  GPIO 39: frames 5009 (999.9/s) | TX errors 0 | command pauses 0
+  GPIO 38: frames 5009 (999.9/s) | TX errors 0 | command pauses 0
+  GPIO 40: frames 5009 (999.9/s) | TX errors 0 | command pauses 0
+Stage profile: off (basic sample, not compiled, or worker not pinned)
+Bench stack minimum free after reporting: 5828 bytes
+  Motor 1 RX: replies 5009 | no response 0 (timeouts 0, empty/idle 0)
+    malformed 0 | GCR 0 | CRC 0 | overflow 0 | errors 0
+  Motor 2 RX: replies 5009 | no response 0 (timeouts 0, empty/idle 0)
+    malformed 0 | GCR 0 | CRC 0 | overflow 0 | errors 0
+  Motor 3 RX: replies 5009 | no response 0 (timeouts 0, empty/idle 0)
+    malformed 0 | GCR 0 | CRC 0 | overflow 0 | errors 0
+  Motor 4 RX: replies 5009 | no response 0 (timeouts 0, empty/idle 0)
+    malformed 0 | GCR 0 | CRC 0 | overflow 0 | errors 0
+
+dshot> profile 5
+Sampling profile for 5 seconds; keep the workload unchanged...
+dshot> profile: 5.010 s | D600 bidirectional | target 1000 Hz | worker core 1
+  stream running | detailed timing off | snapshot overhead 624/573 us
+  active outputs: 1(raw 0) 2(raw 0) 3(raw 0) 4(raw 0)
+CPU0: 0.2% busy
+CPU1: 35.4% busy
+CPU average: 17.8% busy
+Task runtime: 100% = one core; idle tasks included
+  task               runtime us     CPU % stack free B
+  dshot_bench             10039     0.20%         5828
+  IDLE1                 3234748    64.57%          796
+  IDLE0                 5000973    99.83%          796
+  dshot_tx              1774367    35.42%         2456
+  console_repl              801     0.02%         2820
+  ipc0                        0     0.00%          616
+  ipc1                        0     0.00%          616
+  RTOS task accounting includes interrupt time in the interrupted task; ISR cost is not separated.
+DShot window: passes 5007 (999.5/s) | missed slots 2
+  GPIO 18: frames 5007 (999.5/s) | TX errors 0 | command pauses 0
+  GPIO 39: frames 5007 (999.5/s) | TX errors 0 | command pauses 0
+  GPIO 38: frames 5007 (999.5/s) | TX errors 0 | command pauses 0
+  GPIO 40: frames 5007 (999.5/s) | TX errors 0 | command pauses 0
+Stage profile: 312 sampled updates / 5007 | interval 1/16 | idle clamps 0
+  stage                 visits  elapsed us/v     busy us/v  est core %
+  empty probe              312          2.00          2.00       0.20%
+  frame preparation       1248          4.11          4.11       1.64%
+  symbol encoding         1248          3.87          3.87       1.55%
+  RX setup                1248         10.71         10.71       4.28%
+  TX submission           1248         17.13         17.13       6.85%
+  TX wait                 1248         43.32         23.26       9.30%
+  RX wait                 1248         86.73         15.40       6.15%
+  RX finish               1248          2.80          2.80       1.12%
+  echo removal            1248         10.55         10.55       4.22%
+  reply decoding          1248         21.73         21.73       8.69%
+  telemetry update        1248          8.30          8.30       3.32%
+  raw capture copy        1248          3.36          3.36       1.34%
+  link finish             3744          4.31          4.31       5.17%
+  bookkeeping             1560          5.12          5.12       2.56%
+  Elapsed includes blocking; busy subtracts core idle and can include other tasks.
+  Core % extrapolates sampled updates; probe/measurement overhead and sampling bias apply.
+  Scheduler work outside the sampled pass, aggregate merging, and separate ISR costs are not covered.
+Bench stack minimum free after reporting: 5828 bytes
+  Motor 1 RX: replies 5007 | no response 0 (timeouts 0, empty/idle 0)
+    malformed 0 | GCR 0 | CRC 0 | overflow 0 | errors 0
+  Motor 2 RX: replies 5007 | no response 0 (timeouts 0, empty/idle 0)
+    malformed 0 | GCR 0 | CRC 0 | overflow 0 | errors 0
+  Motor 3 RX: replies 5007 | no response 0 (timeouts 0, empty/idle 0)
+    malformed 0 | GCR 0 | CRC 0 | overflow 0 | errors 0
+  Motor 4 RX: replies 5007 | no response 0 (timeouts 0, empty/idle 0)
+    malformed 0 | GCR 0 | CRC 0 | overflow 0 | errors 0
+

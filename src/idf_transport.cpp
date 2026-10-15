@@ -1,5 +1,6 @@
 #include "idf_transport.hpp"
 #include "config_validation.hpp"
+#include "stage_profiler.hpp"
 
 #include <cstdlib>
 #include "esp_log.h"
@@ -137,7 +138,8 @@ esp_err_t open_transport(RmtTransport& transport, gpio_num_t gpio, const Config&
 }
 
 esp_err_t send_packet(RmtTransport& transport, std::uint16_t packet,
-                      std::uint64_t* wait_us) {
+                      std::uint64_t* wait_us, StageProfiler* profile) {
+    profile_stage(profile, ProfileStage::SymbolEncode);
     if (wait_us) *wait_us = 0;
     transport.rx_wait_us = 0;
     transport.rx_timed_out = false;
@@ -149,8 +151,10 @@ esp_err_t send_packet(RmtTransport& transport, std::uint16_t packet,
     if (transport.bidirectional) packet ^= 0xF;
     esp_err_t error = encode_regular_symbols(packet, transport.timing, transport.symbols);
     if (error != ESP_OK) return error;
-    if (transport.bidirectional) {
+    if (transport.bidirectional)
         for (auto& symbol : transport.symbols) { symbol.level0 = 0; symbol.level1 = 1; }
+    if (transport.bidirectional) {
+        profile_stage(profile, ProfileStage::RxSetup);
         if (!transport.rx_enabled) {
             error = rmt_enable(transport.rx_channel);
             if (error != ESP_OK) { transport.faulted = true; return error; }
@@ -177,6 +181,7 @@ esp_err_t send_packet(RmtTransport& transport, std::uint16_t packet,
         }
     }
 
+    profile_stage(profile, ProfileStage::TxSubmit);
     rmt_transmit_config_t transmit_config{};
     transmit_config.loop_count = 0;
     transmit_config.flags.eot_level = transport.bidirectional ? 1 : 0;
@@ -197,7 +202,9 @@ esp_err_t send_packet(RmtTransport& transport, std::uint16_t packet,
 #if CONFIG_DSHOT_TIMING_DIAGNOSTICS
     const auto wait_started = esp_timer_get_time();
 #endif
+    profile_stage(profile, ProfileStage::TxWait);
     error = rmt_tx_wait_all_done(transport.tx_channel, kTxTimeoutMs);
+    profile_stage(profile, ProfileStage::LinkFinish);
 #if CONFIG_DSHOT_TIMING_DIAGNOSTICS
     if (wait_us) *wait_us = esp_timer_get_time() - wait_started;
 #endif
@@ -210,7 +217,9 @@ esp_err_t send_packet(RmtTransport& transport, std::uint16_t packet,
     transport.in_flight = false;
     if (transport.bidirectional && error == ESP_OK) {
         const auto rx_started = esp_timer_get_time();
+        profile_stage(profile, ProfileStage::RxWait);
         const bool done = xSemaphoreTake(transport.rx_done, pdMS_TO_TICKS(2) + 1) == pdTRUE;
+        profile_stage(profile, ProfileStage::RxFinish);
         transport.rx_timed_out = !done;
         portENTER_CRITICAL(&transport.rx_lock);
         transport.accept_rx = false;
@@ -222,11 +231,16 @@ esp_err_t send_packet(RmtTransport& transport, std::uint16_t packet,
             transport.reply.result = done ? ReplyResult::ReceiveError : ReplyResult::NoResponse;
         } else if (count >= 32) {
             transport.reply.result = ReplyResult::Overflow;
-        } else if (!strip_transmit_echo(transport.rx_symbols, transport.rx_count, transport.symbols)) {
-            transport.reply.result = ReplyResult::Malformed;
         } else {
-            transport.reply = decode_reply(transport.rx_symbols,transport.rx_count,kRMTResolutionHz,transport.bitrate);
+            profile_stage(profile, ProfileStage::EchoStrip);
+            if (!strip_transmit_echo(transport.rx_symbols, transport.rx_count, transport.symbols)) {
+                transport.reply.result = ReplyResult::Malformed;
+            } else {
+                profile_stage(profile, ProfileStage::ReplyDecode);
+                transport.reply = decode_reply(transport.rx_symbols,transport.rx_count,kRMTResolutionHz,transport.bitrate);
+            }
         }
+        profile_stage(profile, ProfileStage::LinkFinish);
         transport.rx_wait_us = esp_timer_get_time() - rx_started;
     }
     if (transport.bidirectional) gpio_ll_output_disable(&GPIO, transport.gpio);

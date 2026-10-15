@@ -124,6 +124,27 @@ menu "DShot"
         default y
         select RMT_RECV_FUNC_IN_IRAM
 
+    config DSHOT_STAGE_PROFILING
+        bool "Compile sampled per-stage profiling"
+        depends on FREERTOS_GENERATE_RUN_TIME_STATS && FREERTOS_RUN_TIME_STATS_USING_ESP_TIMER
+        default n
+        help
+            Allow Driver::set_stage_profiling() and the bench4 profile command to
+            sample stage elapsed time and core busy time (elapsed minus idle).
+            Multicore targets require a pinned worker. Other tasks and interrupt
+            attribution can affect busy estimates; this is not an ISR profiler.
+            Samples are collected only while requested, independently of the
+            older detailed timing diagnostics.
+
+    config DSHOT_STAGE_PROFILE_INTERVAL
+        int "Worker updates between stage samples"
+        depends on DSHOT_STAGE_PROFILING
+        range 1 1024
+        default 16
+        help
+            Sample one worker update in this many updates. Larger values reduce
+            measurement overhead. Whole-task/core runtime remains unsampled.
+
     config DSHOT_TIMING_DIAGNOSTICS
         bool "Compile detailed timing instrumentation"
         default n

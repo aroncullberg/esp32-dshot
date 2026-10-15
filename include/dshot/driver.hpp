@@ -6,6 +6,7 @@
 #include "esp_err.h"
 
 namespace dshot {
+namespace detail { class StageProfiler; }
 class Link;
 class Passthrough;
 
@@ -20,6 +21,10 @@ public:
     // Cleared before creating a new transmission task.
     esp_err_t last_error() const;
     DriverStatistics statistics() const;
+    // Fill existing storage without a large return-value temporary on the caller's stack.
+    void statistics(DriverStatistics& destination) const;
+    // Sample stage timings only while enabled. Requires a pinned worker on multicore targets.
+    esp_err_t set_stage_profiling(bool enabled);
 
     Driver(const Driver&) = delete;
     Driver& operator=(const Driver&) = delete;
@@ -33,7 +38,7 @@ private:
     esp_err_t prepare_link(const Link& link);
     esp_err_t attach_link(Link& link);
     void detach_link(Link& link);
-    esp_err_t send_once(std::uint64_t& wait_us);
+    esp_err_t send_once(std::uint64_t& wait_us, detail::StageProfiler* profile = nullptr);
     static void worker_entry(void* argument);
     void worker_loop();
 

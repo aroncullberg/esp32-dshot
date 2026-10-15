@@ -13,6 +13,24 @@ struct TimingStatistics {
     std::uint64_t max_us = 0;
 };
 
+enum class ProfileStage : std::size_t {
+    Probe, FramePrepare, SymbolEncode, RxSetup, TxSubmit, TxWait, RxWait,
+    RxFinish, EchoStrip, ReplyDecode, TelemetryUpdate, CaptureCopy, LinkFinish, Bookkeeping, Count
+};
+struct StageTimingStatistics {
+    std::uint64_t count = 0;
+    std::uint64_t elapsed_us = 0;
+    // Elapsed time minus this core's accounted idle time, not exclusive task/ISR time.
+    std::uint64_t busy_us = 0;
+};
+struct StageProfileStatistics {
+    bool available = false;
+    unsigned sample_interval = 0;
+    std::uint64_t sampled_passes = 0;
+    std::uint64_t idle_clamps = 0;
+    std::array<StageTimingStatistics, static_cast<std::size_t>(ProfileStage::Count)> stages{};
+};
+
 struct LinkStatistics {
     int gpio = -1;
     std::uint64_t completed_frames = 0;
@@ -37,5 +55,6 @@ struct DriverStatistics {
     TimingStatistics outside_tx_wait;
     std::size_t link_count = 0;
     std::array<LinkStatistics, max_links> links{};
+    StageProfileStatistics stage_profile;
 };
 }

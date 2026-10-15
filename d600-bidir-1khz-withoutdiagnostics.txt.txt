@@ -1,0 +1,60 @@
+
+Unrecognized command
+dshot> profile
+Sampling profile for 3 seconds; keep the workload unchanged...
+dshot> profile: 3.010 s | D600 bidirectional | target 1000 Hz | worker core 1
+  stream stopped | detailed timing off | snapshot overhead 373/258 us
+  active outputs: none
+CPU0: 0.2% busy
+CPU1: 0.0% busy
+CPU average: 0.1% busy
+Task runtime: 100% = one core; idle tasks included
+  task               runtime us     CPU %
+  dshot_bench              5501     0.18%
+  IDLE1                 3009245    99.97%
+  IDLE0                 3005620    99.85%
+  console_repl              479     0.02%
+  ipc0                        0     0.00%
+  ipc1                        0     0.00%
+  RTOS task accounting includes interrupt time in the interrupted task; ISR cost is not separated.
+DShot window: passes 0 (0.0/s) | missed slots 0
+
+dshot> motor all
+selected motors: 1 2 3 4
+dshot> arm
+dshot> arming
+armed
+
+dshot> profile
+Sampling profile for 3 seconds; keep the workload unchanged...
+dshot> profile: 3.010 s | D600 bidirectional | target 1000 Hz | worker core 1
+  stream running | detailed timing off | snapshot overhead 575/404 us
+  active outputs: 1(raw 0) 2(raw 0) 3(raw 0) 4(raw 0)
+CPU0: 0.2% busy
+CPU1: 38.5% busy
+CPU average: 19.3% busy
+Task runtime: 100% = one core; idle tasks included
+  task               runtime us     CPU %
+  dshot_bench              6222     0.21%
+  IDLE1                 1852241    61.53%
+  IDLE0                 3005067    99.83%
+  console_repl              737     0.02%
+  dshot_tx              1157411    38.45%
+  ipc0                        0     0.00%
+  ipc1                        0     0.00%
+  RTOS task accounting includes interrupt time in the interrupted task; ISR cost is not separated.
+DShot window: passes 3009 (999.6/s) | missed slots 1
+  GPIO 18: frames 3009 (999.6/s) | TX errors 0 | command pauses 0
+  GPIO 39: frames 3009 (999.6/s) | TX errors 0 | command pauses 0
+  GPIO 38: frames 3009 (999.6/s) | TX errors 0 | command pauses 0
+  GPIO 40: frames 3009 (999.6/s) | TX errors 0 | command pauses 0
+  Motor 1 RX: replies 3009 | no response 0 (timeouts 0, empty/idle 0)
+    malformed 0 | GCR 0 | CRC 0 | overflow 0 | errors 0
+  Motor 2 RX: replies 3009 | no response 0 (timeouts 0, empty/idle 0)
+    malformed 0 | GCR 0 | CRC 0 | overflow 0 | errors 0
+  Motor 3 RX: replies 3009 | no response 0 (timeouts 0, empty/idle 0)
+    malformed 0 | GCR 0 | CRC 0 | overflow 0 | errors 0
+  Motor 4 RX: replies 3009 | no response 0 (timeouts 0, empty/idle 0)
+    malformed 0 | GCR 0 | CRC 0 | overflow 0 | errors 0
+
+

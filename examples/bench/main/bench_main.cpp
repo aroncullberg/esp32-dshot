@@ -5,6 +5,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
+#include <new>
 
 #include "sdkconfig.h"
 #include "dshot/config.hpp"
@@ -16,6 +18,9 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#if DSHOT_BENCH_FOUR_MOTORS
+#include "bench_profile.hpp"
+#endif
 
 namespace {
 #if DSHOT_BENCH_FOUR_MOTORS
@@ -28,7 +33,7 @@ constexpr std::array<gpio_num_t, 4> motor_pins{
 constexpr std::array<gpio_num_t, 1> motor_pins{static_cast<gpio_num_t>(CONFIG_DSHOT_BENCH_GPIO)};
 #endif
 constexpr unsigned all_motors = (1u << motor_pins.size()) - 1;
-enum class Action { Arm, Run, Stop, Stats, EscCommand, CommandStatus, Telemetry, TelemetryRaw, Edt, Motor };
+enum class Action { Arm, Run, Stop, Stats, EscCommand, CommandStatus, Telemetry, TelemetryRaw, Edt, Motor, Profile };
 struct Command {
     Action action;
     std::uint16_t payload = 0;
@@ -57,6 +62,55 @@ int stats_command(int argc, char**) {
 }
 
 #if DSHOT_BENCH_FOUR_MOTORS
+int profile_command(int argc, char** argv) {
+    const bool basic = argc >= 2 && std::strcmp(argv[argc - 1], "basic") == 0;
+    argc -= basic;
+    const std::uint16_t flags = basic ? 0x8000 : 0;
+    if (argc == 1) return enqueue({Action::Profile, static_cast<std::uint16_t>(3 | flags)});
+    if (argc == 2 && argv[1][0] >= '0' && argv[1][0] <= '9') {
+        errno = 0;
+        char* end = nullptr;
+        const auto seconds = std::strtoul(argv[1], &end, 10);
+        if (!errno && *end == '\0' && seconds >= 1 && seconds <= 30)
+            return enqueue({Action::Profile, static_cast<std::uint16_t>(seconds | flags)});
+    }
+    std::puts("profile [seconds: 1..30; default 3] [basic]");
+    return 1;
+}
+
+int cpu_command(int argc, char**) {
+    if (argc != 1) { std::puts("cpu"); return 1; }
+#if CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS
+    using Counter = configRUN_TIME_COUNTER_TYPE;
+    std::array<Counter, configNUMBER_OF_CORES> idle_before{}, idle_after{};
+    std::puts("Sampling CPU usage for 1 second...");
+    const auto start = portGET_RUN_TIME_COUNTER_VALUE();
+    for (BaseType_t core = 0; core < configNUMBER_OF_CORES; ++core)
+        idle_before[core] = ulTaskGetIdleRunTimeCounterForCore(core);
+
+    // Sample in the console task so the bench worker keeps processing commands and arming.
+    vTaskDelay(pdMS_TO_TICKS(1000));
+
+    for (BaseType_t core = 0; core < configNUMBER_OF_CORES; ++core)
+        idle_after[core] = ulTaskGetIdleRunTimeCounterForCore(core);
+    const Counter elapsed = portGET_RUN_TIME_COUNTER_VALUE() - start;
+    if (elapsed == 0) { std::puts("cpu: no elapsed run time"); return 1; }
+    double total = 0;
+    for (BaseType_t core = 0; core < configNUMBER_OF_CORES; ++core) {
+        const Counter idle = idle_after[core] - idle_before[core];
+        // Idle accounting is updated on context switches; clamp sampling skew.
+        const double usage = idle >= elapsed ? 0.0 : 100.0 * (1.0 - static_cast<double>(idle) / elapsed);
+        std::printf("CPU%d: %.1f%% busy\n", static_cast<int>(core), usage);
+        total += usage;
+    }
+    std::printf("CPU average: %.1f%% busy\n", total / configNUMBER_OF_CORES);
+    return 0;
+#else
+    std::puts("cpu: enable CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS and rebuild");
+    return 1;
+#endif
+}
+
 int motor_command(int argc, char** argv) {
     if (argc == 2) {
         if (std::strcmp(argv[1], "all") == 0) return enqueue({Action::Motor, all_motors});
@@ -262,27 +316,56 @@ void register_command(const char* name, const char* help, esp_console_cmd_func_t
     ESP_ERROR_CHECK(esp_console_cmd_register(&command));
 }
 
-void bench_worker(void*) {
+// Keep persistent state and statistics buffers on the heap. At -O2, inlining
+// otherwise combines these with reporting temporaries in the worker stack frame.
+struct BenchState {
     dshot::Config config;
-    dshot::Driver driver(config);
+    dshot::Driver driver{config};
 #if DSHOT_BENCH_FOUR_MOTORS
     std::array<dshot::Link, 4> links{{{driver, motor_pins[0]}, {driver, motor_pins[1]},
                                    {driver, motor_pins[2]}, {driver, motor_pins[3]}}};
 #else
     std::array<dshot::Link, 1> links{{{driver, motor_pins[0]}}};
 #endif
+    std::array<std::uint16_t, motor_pins.size()> requested_payloads{};
+    dshot::DriverStatistics previous_statistics;
+    dshot::DriverStatistics statistics_snapshot;
+};
+
+void bench_worker(void*) {
+    std::unique_ptr<BenchState> state(new (std::nothrow) BenchState);
+    if (!state) {
+        std::puts("bench state allocation failed");
+        vTaskDelete(nullptr);
+        return;
+    }
+    auto& driver = state->driver;
+    auto& links = state->links;
+    auto& requested_payloads = state->requested_payloads;
+    auto& previous_statistics = state->previous_statistics;
     bool opened = false;
     unsigned opened_motors = 0;
     unsigned selected_motors = all_motors;
     int64_t arm_until_us = 0;
-    std::array<std::uint16_t, motor_pins.size()> requested_payloads{};
-    dshot::DriverStatistics previous_statistics;
+#if DSHOT_BENCH_RUNTIME_PROFILE_ENABLED
+    std::unique_ptr<bench::RuntimeProfile> profile;
+#endif
+    auto cancel_profile = [&]() {
+#if DSHOT_BENCH_RUNTIME_PROFILE_ENABLED
+        if (profile) {
+            (void)driver.set_stage_profiling(false);
+            profile.reset();
+            std::puts("profile cancelled: workload changed");
+        }
+#endif
+    };
 
     auto selected = [&](std::size_t i) { return (selected_motors & (1u << i)) != 0; };
     auto label = [&](std::size_t i) {
         if (motor_pins.size() > 1) std::printf("Motor %u (GPIO %d):\n", static_cast<unsigned>(i + 1), motor_pins[i]);
     };
     auto close_on_error = [&]() {
+        cancel_profile();
         driver.stop();
         for (auto& link : links) link.end();
         opened = false;
@@ -343,9 +426,31 @@ void bench_worker(void*) {
             }
             if (opened) std::puts("armed");
         }
+#if DSHOT_BENCH_RUNTIME_PROFILE_ENABLED
+        if (profile && esp_timer_get_time() >= profile->deadline_us) {
+            profile->finish(state->config, driver, links, opened_motors, requested_payloads);
+            profile.reset();
+        }
+#endif
         if (!received) continue;
 
+        if (command.action == Action::Arm || command.action == Action::Run || command.action == Action::Stop ||
+            command.action == Action::EscCommand || command.action == Action::Edt) cancel_profile();
+
         switch (command.action) {
+        case Action::Profile:
+#if DSHOT_BENCH_RUNTIME_PROFILE_ENABLED
+            if (profile) { std::puts("profile: sample already running"); break; }
+            if (arm_until_us) { std::puts("profile: wait until armed"); break; }
+            profile.reset(new (std::nothrow) bench::RuntimeProfile);
+            if (!profile) { std::puts("profile: allocation failed"); break; }
+            std::printf("Sampling profile for %u seconds; keep the workload unchanged...\n", static_cast<unsigned>(command.payload & 0x7fff));
+            if (!profile->start(command.payload & 0x7fff, driver, links, opened_motors,
+                                !(command.payload & 0x8000))) profile.reset();
+#else
+            std::puts("profile: enable CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS and CONFIG_FREERTOS_RUN_TIME_STATS_USING_ESP_TIMER, then rebuild");
+#endif
+            break;
         case Action::Arm: {
             if (opened && opened_motors != selected_motors) close_on_error();
             if (!opened) {
@@ -392,7 +497,8 @@ void bench_worker(void*) {
             if (!opened || set_payload(0, opened_motors)) std::puts("stopped");
             break;
         case Action::Stats: {
-            const auto snapshot = driver.statistics();
+            auto& snapshot = state->statistics_snapshot;
+            driver.statistics(snapshot);
             print_statistics(snapshot, previous_statistics);
             for (std::size_t i = 0; i < links.size(); ++i) {
                 if (!(opened_motors & (1u << i))) continue;
@@ -493,6 +599,8 @@ extern "C" void app_main() {
     register_command("telemetry", "Show eRPM/EDT and counters; telemetry raw shows captured pulses", telemetry_command);
     register_command("edt", "edt <on|off|status>", edt_command);
 #if DSHOT_BENCH_FOUR_MOTORS
+    register_command("profile", "profile [1..30 seconds] [basic]: task/runtime and sampled stages (default 3 seconds)", profile_command);
+    register_command("cpu", "Show per-core CPU usage over a 1-second sample", cpu_command);
     register_command("motor", "motor <1..4|all>: select targets; arm opens only the selection; stop always stops all", motor_command);
 #endif
     for (std::size_t i = 0; i < motor_pins.size(); ++i)
